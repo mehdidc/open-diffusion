@@ -1,0 +1,98 @@
+wandb:
+    api_key: null
+    entity: null
+    mode: offline
+
+system:
+    gradient_accumulation: 1
+    batch_size: 16
+    workers: 4
+    dist_backend: ${distributed.dist_backend}
+    dist_url: ${distributed.dist_url}
+
+distributed:
+    dist_backend: 'nccl'
+    dist_url: 'env://'
+
+experiment:
+    log_dir: ./logs
+    name: "test"
+    project: "stable-diffusion"
+    num_examples_to_see: 2000000000
+    save_every: 2000
+    requeue: True
+    eval_caption_file: data/prompts/uid_caption.csv
+    num_eval_images: 200
+
+optimizer:
+    name: adamw
+    params:
+        learning_rate: 0.0001
+        beta1: 0.9
+        beta2: 0.98 # changed from initial sd value for training stability
+        weight_decay: 0.01
+        epsilon: 0.00000001
+
+model:
+    pt_path: sd1.5
+    vae:
+        pretrained: ${model.pt_path}
+
+    text_encoder:
+        pretrained: ${model.pt_path}
+    
+    tokenizer:
+        pretrained: ${model.pt_path}
+        
+    noise_scheduler_training:
+        pretrained: ${model.pt_path}
+        target: DDPMNoiseScheduler
+
+    noise_scheduler_inference:
+        pretrained: ${model.pt_path}
+        target: EulerDiscreteScheduler
+
+    unet:
+        target: UNet2DConditionModel
+        params:
+            act_fn: "silu"
+            attention_head_dim: 8
+            block_out_channels: [320, 640, 1280, 1280]
+            center_input_sample: False
+            cross_attention_dim: 768
+            down_block_types: ["CrossAttnDownBlock2D","CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "DownBlock2D"]
+            downsample_padding: 1
+            flip_sin_to_cos: true
+            freq_shift: 0
+            in_channels: 4
+            layers_per_block: 2
+            mid_block_scale_factor: 1
+            norm_eps: 1e-05
+            norm_num_groups: 32
+            out_channels: 4
+            sample_size: 32
+            up_block_types: [
+                "UpBlock2D",
+                "CrossAttnUpBlock2D",
+                "CrossAttnUpBlock2D",
+                "CrossAttnUpBlock2D"
+            ]
+    use_ema: True 
+    mixed_precision: bf16
+    gradient_checkpointing: True
+    xformers: True
+
+dataset:
+    type: WebDataset
+    params: 
+        path: /p/scratch/ccstdl/cherti1/datacomp_1B/{0000000..0139827}.tar
+        batch_size: ${system.batch_size}
+        workers: ${system.workers}
+        num_examples_to_see: ${experiment.num_examples_to_see}
+        resolution: 224
+
+lr_scheduler:
+    scheduler: "ConstantWithWarmup"
+    params:
+        learning_rate: ${optimizer.params.learning_rate}
+        warmup_length: 500    
