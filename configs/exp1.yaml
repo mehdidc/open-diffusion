@@ -7,8 +7,6 @@ system:
     gradient_accumulation: 1
     batch_size: 64
     workers: 4
-
-
     use_pooled_for_conditioning: True
     image_to_image_loss_weight: 0.5
     text_to_image_loss_weight: 0.5
@@ -22,7 +20,7 @@ distributed:
 
 experiment:
     log_dir: ./logs
-    name: "datacomp"
+    name: "datacomp_exp1"
     project: "stable-diffusion"
     num_examples_to_see: 1400000000
     save_every: 1000

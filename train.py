@@ -292,6 +292,7 @@ def main():
         # TODO (vkramanuj) Maybe fairscale would be more memory efficient
         # TODO (vkramanuj) Apply FSDP from fairscale
         unet.enable_gradient_checkpointing()
+        #clip.enable_gradient_checkpointing()
         log_if_global_master("Enabling gradient checkpointing")
 
     if config.model.get("xformers", False):
@@ -428,10 +429,12 @@ def main():
         # Main training loop
         with torch.autocast(device_type="cuda", dtype=weight_dtype):
             # Compute clean and noised targets, no gradients needed (text_encoder frozen)
+            image_out = clip.vision_model(batch["pixel_values"].to(device))
+            text_out = clip.text_model(batch["input_ids"].to(device))
+
             with torch.no_grad():
                 # Ground-truth image latent, no noise
                 #image_emb, image_encoder_hidden_states = encode_image(encoder, batch["pixel_values"].to(device))
-                image_out = clip.vision_model(batch["pixel_values"].to(device))
                 latents = vae.encode(
                     batch["pixel_values"].to(device)
                 ).latent_dist.sample()
@@ -457,29 +460,40 @@ def main():
 
                 # Compute text conditioning
                 #text_emb, text_encoder_hidden_states = encode_text(encoder, batch["input_ids"].to(device))
-                text_out = clip.text_model(batch["input_ids"].to(device))
             # print(text_encoder_hidden_states.shape, image_encoder_hidden_states.shape)
             # Noise prediction
             # p = encoder.proj_text(text_encoder_hidden_states)
+            if config.system.use_pooled_for_conditioning:
+                text_embs = clip.text_projection2(text_out.pooler_output)
+                text_embs = text_embs.view(text_embs.shape[0], 1, text_embs.shape[1])
+            else:
+                text_embs = clip.text_projection2(text_out.last_hidden_state)
             (noise_pred,) = unet(
-                noisy_latents, timesteps, clip.text_projection2(text_out.last_hidden_state), return_dict=False
+                noisy_latents, timesteps, text_embs, return_dict=False
             )
             # Compute loss based on noise prediction
             text_to_image_loss = F.mse_loss(noise_pred, noise, reduction="mean")
             # p = encoder.proj_image(image_encoder_hidden_states)
+            if config.system.use_pooled_for_conditioning:
+                image_embs = clip.visual_projection2(image_out.pooler_output)
+                image_embs = image_embs.view(image_embs.shape[0], 1, image_embs.shape[1])
+            else:
+                image_embs = clip.visual_projection2(image_out.last_hidden_state)
             (noise_pred,) = unet(
-                noisy_latents, timesteps, clip.visual_projection2(image_out.last_hidden_state), return_dict=False
+                noisy_latents, timesteps, image_embs, return_dict=False
             )
             # Compute loss based on noise prediction
             image_to_image_loss = F.mse_loss(noise_pred, noise, reduction="mean")
 
-
-            clip_loss_value = clip_loss(
-                clip.visual_projection(image_out.pooler_output), 
-                clip.text_projection(text_out.pooler_output), 
-                clip.logit_scale, 
-                output_dict=False
-            )
+            if config.system.clip_loss_weight  > 0:
+                clip_loss_value = clip_loss(
+                    clip.visual_projection(image_out.pooler_output), 
+                    clip.text_projection(text_out.pooler_output), 
+                    clip.logit_scale, 
+                    output_dict=False
+                )
+            else:
+                clip_loss_value = torch.tensor(0.0)
             loss = (
                     text_to_image_loss * config.system.text_to_image_loss_weight + 
                     image_to_image_loss * config.system.image_to_image_loss_weight + 
@@ -589,10 +603,11 @@ def validate_and_save_model(
     if ema_unet is not None:
         ema_unet.store(unet.parameters())
         ema_unet.copy_to(unet.parameters())
-
+    text_encoder = CLIPTextModel.from_pretrained("sd1.5/text_encoder")
+    text_encoder.text_model = clip.text_model
     generate_examples(
         config,
-        text_encoder=clip.text_model,
+        text_encoder=text_encoder,
         vae=vae,
         unet=unet,
         tokenizer=tokenizer,
