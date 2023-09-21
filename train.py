@@ -47,7 +47,7 @@ from diffusers.optimization import get_scheduler
 from diffusers.pipelines.stable_diffusion import StableDiffusionSafetyChecker
 
 from tqdm.auto import tqdm
-from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer
+from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPVisionModel, CLIPTokenizer
 
 from utils.data_utils import batchify
 from utils.getters import get_config, get_optimizer, get_experiment_folder
@@ -63,6 +63,79 @@ import shutil
 
 import pandas as pd
 import time
+import inspect
+from typing import Any, Callable, Dict, List, Optional, Union
+
+class StableDiffusionPipelineExt(StableDiffusionPipeline):
+    def __init__(
+        self,
+        vae,
+        text_encoder,
+        image_encoder,
+        tokenizer,
+        unet,
+        scheduler,
+        safety_checker,
+        feature_extractor,
+        requires_safety_checker: bool = True,
+    ):
+        
+        super().__init__(vae, text_encoder, tokenizer, unet, scheduler, safety_checker, feature_extractor, requires_safety_checker)
+        self.register_modules(
+            image_encoder=image_encoder,
+        )
+
+def encode_image(self, x, normalize: bool = False, full=False):
+    self = self.visual
+    self.input_patchnorm = False
+    # to patches - whether to use dual patchnorm - https://arxiv.org/abs/2302.01327v1
+    if self.input_patchnorm:
+        # einops - rearrange(x, 'b c (h p1) (w p2) -> b (h w) (c p1 p2)')
+        x = x.reshape(x.shape[0], x.shape[1], self.grid_size[0], self.patch_size[0], self.grid_size[1], self.patch_size[1])
+        x = x.permute(0, 2, 4, 1, 3, 5)
+        x = x.reshape(x.shape[0], self.grid_size[0] * self.grid_size[1], -1)
+        x = self.patchnorm_pre_ln(x)
+        x = self.conv1(x)
+    else:
+        x = self.conv1(x)  # shape = [*, width, grid, grid]
+        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
+        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
+
+    # class embeddings and positional embeddings
+    x = torch.cat(
+        [self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device),
+         x], dim=1)  # shape = [*, grid ** 2 + 1, width]
+    x = x + self.positional_embedding.to(x.dtype)
+
+    # a patch_dropout of 0. would mean it is disabled and this function would do nothing but return what was passed in
+    x = self.patch_dropout(x)
+    x = self.ln_pre(x)
+
+    x = x.permute(1, 0, 2)  # NLD -> LND
+    x = self.transformer(x)
+    x = x.permute(1, 0, 2)  # LND -> NLD
+
+    pooled, tokens = self._global_pool(x)
+    pooled = self.ln_post(pooled)
+
+    if self.proj is not None:
+        pooled = pooled @ self.proj
+
+    return pooled, tokens
+
+
+def encode_text(self, text, normalize: bool = False, full=False):
+    cast_dtype = self.transformer.get_cast_dtype()
+    x = self.token_embedding(text).to(cast_dtype)  # [batch_size, n_ctx, d_model]
+    x = x + self.positional_embedding.to(cast_dtype)
+    x = x.permute(1, 0, 2)  # NLD -> LND
+    x = self.transformer(x, attn_mask=self.attn_mask)
+    x = x.permute(1, 0, 2)  # LND -> NLD
+    x = self.ln_final(x)  # [batch_size, n_ctx, transformer.width]
+    tokens = x
+    x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
+    return F.normalize(x, dim=-1) if normalize else x, tokens
+
 
 
 def set_seed(seed):
@@ -183,10 +256,18 @@ def main():
     tokenizer = maybe_load_model(
         config, "tokenizer", default_model_factory=CLIPTokenizer
     )
-
+    #import open_clip 
+    #encoder, _, preprocess = open_clip.create_model_and_transforms('ViT-L-14', pretrained='openai')
+    #encoder.proj_text = torch.nn.Linear(768, 768)
+    #encoder.proj_image = torch.nn.Linear(1024, 768)
+    #encoder = encoder.to(device)
+    
     text_encoder = maybe_load_model(
-        config, "text_encoder", default_model_factory=CLIPTextModel
-    ).to(device, dtype=torch.float32)
+         config, "text_encoder", default_model_factory=CLIPTextModel
+     ).to(device, dtype=torch.float32)
+    image_encoder = maybe_load_model(
+         config, "image_encoder", default_model_factory=CLIPVisionModel
+     ).to(device, dtype=torch.float32)
 
     # UNet is trainable, need to apply DDP, gradient checkpointing, etc.
     unet = maybe_load_model(
@@ -207,7 +288,7 @@ def main():
 
     # Freeze vae and text_encoder
     vae.requires_grad_(False)
-    text_encoder.requires_grad_(False)
+    # text_encoder.requires_grad_(False)
 
     # Create EMA for the unet.
     ema_unet = None
@@ -276,7 +357,7 @@ def main():
 
     # Eval mode everything else
     vae.eval()
-    text_encoder.eval()
+    # text_encoder.eval()
 
     # Initialize counter for gradient accumulation
     grad_steps = 0
@@ -329,6 +410,8 @@ def main():
             # Compute clean and noised targets, no gradients needed (text_encoder frozen)
             with torch.no_grad():
                 # Ground-truth image latent, no noise
+                #image_emb, image_encoder_hidden_states = encode_image(encoder, batch["pixel_values"].to(device))
+                image_emb = image_encoder(batch["pixel_values"].to(device)).pooler_output
                 latents = vae.encode(
                     batch["pixel_values"].to(device)
                 ).latent_dist.sample()
@@ -353,15 +436,28 @@ def main():
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 # Compute text conditioning
-                encoder_hidden_states = text_encoder(batch["input_ids"].to(device))[0]
-
+                #text_emb, text_encoder_hidden_states = encode_text(encoder, batch["input_ids"].to(device))
+                text_emb = text_encoder(batch["input_ids"].to(device)).pooler_output
+            # print(text_encoder_hidden_states.shape, image_encoder_hidden_states.shape)
             # Noise prediction
+            # p = encoder.proj_text(text_encoder_hidden_states)
+            if len(text_emb.shape) == 2: # POOLED case
+                text_emb = text_emb.view(text_emb.shape[0], 1, text_emb.shape[1])
             (noise_pred,) = unet(
-                noisy_latents, timesteps, encoder_hidden_states, return_dict=False
+                noisy_latents, timesteps, text_emb, return_dict=False
             )
-
             # Compute loss based on noise prediction
-            loss = F.mse_loss(noise_pred, noise, reduction="mean")
+            loss = 0.5 * F.mse_loss(noise_pred, noise, reduction="mean")
+            loss = loss / config.system.get("gradient_accumulation", 1)
+            # p = encoder.proj_image(image_encoder_hidden_states)
+
+            if len(image_emb.shape) == 2: # POOLED case
+                image_emb = image_emb.view(image_emb.shape[0], 1, image_emb.shape[1])
+            (noise_pred,) = unet(
+                noisy_latents, timesteps, image_emb, return_dict=False
+            )
+            # Compute loss based on noise prediction
+            loss += 0.5  * F.mse_loss(noise_pred, noise, reduction="mean")
             loss = loss / config.system.get("gradient_accumulation", 1)
 
         # Accumulate gradients
@@ -415,6 +511,7 @@ def main():
                 vae,
                 tokenizer,
                 text_encoder,
+                image_encoder,
                 unet,
                 ema_unet,
                 optimizer,
@@ -432,6 +529,7 @@ def main():
             config=config,
             unet=unet.module,
             text_encoder=text_encoder,
+            image_encoder=image_encoder,
             vae=vae,
             tokenizer=tokenizer,
             optimizer=optimizer,
@@ -447,6 +545,7 @@ def validate_and_save_model(
     vae,
     tokenizer,
     text_encoder,
+    image_encoder,
     unet,
     ema_unet,
     optimizer,
@@ -502,6 +601,7 @@ def validate_and_save_model(
             config=config,
             unet=unet.module,
             text_encoder=text_encoder,
+            image_encoder=image_encoder,
             vae=vae,
             tokenizer=tokenizer,
             optimizer=optimizer,
@@ -581,6 +681,7 @@ def save_model(
     vae,
     tokenizer,
     text_encoder,
+    image_encoder,
     optimizer,
     save_path,
     step,
@@ -591,8 +692,9 @@ def save_model(
         ema_unet.copy_to(unet.parameters())
 
     scheduler = maybe_load_model(config, "noise_scheduler_inference", subfolder="scheduler", default_model_factory=PNDMScheduler)
-    pipeline = StableDiffusionPipeline(
+    pipeline = StableDiffusionPipelineExt(
         text_encoder=text_encoder,
+        image_encoder=image_encoder,
         vae=vae,
         unet=unet,
         tokenizer=tokenizer,
@@ -604,7 +706,6 @@ def save_model(
             "openai/clip-vit-base-patch32"
         ),
     )
-
     pipeline.save_pretrained(save_path)
 
     if ema_unet is not None:
