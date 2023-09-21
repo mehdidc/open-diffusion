@@ -7,6 +7,10 @@ system:
     gradient_accumulation: 1
     batch_size: 16
     workers: 4
+
+    image_to_image_loss: 0.5
+    text_to_image_loss: 0.5
+    clip_loss_weight: 1
     dist_backend: ${distributed.dist_backend}
     dist_url: ${distributed.dist_url}
 
@@ -16,7 +20,7 @@ distributed:
 
 experiment:
     log_dir: ./logs
-    name: "test"
+    name: "datacomp"
     project: "stable-diffusion"
     num_examples_to_see: 2000000000
     save_every: 2000
@@ -37,10 +41,9 @@ model:
     pt_path: sd1.5
     vae:
         pretrained: ${model.pt_path}
-
-    text_encoder:
+    clip:
         pretrained: ${model.pt_path}
-    
+
     tokenizer:
         pretrained: ${model.pt_path}
         
@@ -59,7 +62,7 @@ model:
             attention_head_dim: 8
             block_out_channels: [320, 640, 1280, 1280]
             center_input_sample: False
-            cross_attention_dim: 768
+            cross_attention_dim: 512
             down_block_types: ["CrossAttnDownBlock2D","CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "DownBlock2D"]
             downsample_padding: 1
             flip_sin_to_cos: true

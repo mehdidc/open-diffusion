@@ -47,7 +47,7 @@ from diffusers.optimization import get_scheduler
 from diffusers.pipelines.stable_diffusion import StableDiffusionSafetyChecker
 
 from tqdm.auto import tqdm
-from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPVisionModel, CLIPTokenizer
+from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPVisionModel, CLIPTokenizer, CLIPModel
 
 from utils.data_utils import batchify
 from utils.getters import get_config, get_optimizer, get_experiment_folder
@@ -65,13 +65,20 @@ import pandas as pd
 import time
 import inspect
 from typing import Any, Callable, Dict, List, Optional, Union
+from copy import deepcopy
+
+class CLIPCustom(CLIPModel):
+
+    def __init__(self, config, *args, **kwargs):
+        super().__init__(config, *args, **kwargs)
+        self.visual_projection2 = deepcopy(self.visual_projection)
+        self.text_projection2 = deepcopy(self.text_projection)
 
 class StableDiffusionPipelineExt(StableDiffusionPipeline):
     def __init__(
         self,
         vae,
-        text_encoder,
-        image_encoder,
+        clip,
         tokenizer,
         unet,
         scheduler,
@@ -79,10 +86,10 @@ class StableDiffusionPipelineExt(StableDiffusionPipeline):
         feature_extractor,
         requires_safety_checker: bool = True,
     ):
-        
+        text_encoder = clip.text_model
         super().__init__(vae, text_encoder, tokenizer, unet, scheduler, safety_checker, feature_extractor, requires_safety_checker)
         self.register_modules(
-            image_encoder=image_encoder,
+            clip=clip,
         )
 
 def encode_image(self, x, normalize: bool = False, full=False):
@@ -146,6 +153,8 @@ def set_seed(seed):
     cudnn.deterministic = True
     cudnn.benchmark = False
 
+from contrastive_loss import ClipLoss
+
 
 def main():
     config = get_config()
@@ -153,7 +162,7 @@ def main():
 
     # Saving the config
     device = dist_utils.init_distributed_device(config)
-
+    
     # Setting up logger
     logging.basicConfig(
         filename=Path(config.experiment.folder) / "logs.txt",
@@ -262,13 +271,18 @@ def main():
     #encoder.proj_image = torch.nn.Linear(1024, 768)
     #encoder = encoder.to(device)
     
+    """
     text_encoder = maybe_load_model(
          config, "text_encoder", default_model_factory=CLIPTextModel
      ).to(device, dtype=torch.float32)
     image_encoder = maybe_load_model(
          config, "image_encoder", default_model_factory=CLIPVisionModel
      ).to(device, dtype=torch.float32)
+    """
 
+    clip =  maybe_load_model(
+         config, "clip", default_model_factory=CLIPCustom,
+     ).to(device, dtype=torch.float32)
     # UNet is trainable, need to apply DDP, gradient checkpointing, etc.
     unet = maybe_load_model(
         config, "unet", default_model_factory=UNet2DConditionModel
@@ -381,7 +395,7 @@ def main():
         save_model(
             config=config,
             unet=unet.module,
-            text_encoder=text_encoder,
+            clip=clip,
             vae=vae,
             tokenizer=tokenizer,
             optimizer=optimizer,
@@ -399,6 +413,12 @@ def main():
 
     now = time.time()
     examples_since_last_logged = 0
+    clip_loss = ClipLoss(
+        gather_with_grad=True,
+        local_loss=True,
+        rank=config.system.global_rank,
+        world_size=config.system.world_size,
+    )
     for batch in train_dataset.loader:
         unet.train()
 
@@ -411,7 +431,7 @@ def main():
             with torch.no_grad():
                 # Ground-truth image latent, no noise
                 #image_emb, image_encoder_hidden_states = encode_image(encoder, batch["pixel_values"].to(device))
-                image_emb = image_encoder(batch["pixel_values"].to(device)).pooler_output
+                image_out = clip.vision_model(batch["pixel_values"].to(device))
                 latents = vae.encode(
                     batch["pixel_values"].to(device)
                 ).latent_dist.sample()
@@ -437,27 +457,34 @@ def main():
 
                 # Compute text conditioning
                 #text_emb, text_encoder_hidden_states = encode_text(encoder, batch["input_ids"].to(device))
-                text_emb = text_encoder(batch["input_ids"].to(device)).pooler_output
+                text_out = clip.text_model(batch["input_ids"].to(device))
             # print(text_encoder_hidden_states.shape, image_encoder_hidden_states.shape)
             # Noise prediction
             # p = encoder.proj_text(text_encoder_hidden_states)
-            if len(text_emb.shape) == 2: # POOLED case
-                text_emb = text_emb.view(text_emb.shape[0], 1, text_emb.shape[1])
             (noise_pred,) = unet(
-                noisy_latents, timesteps, text_emb, return_dict=False
+                noisy_latents, timesteps, clip.text_projection2(text_out.last_hidden_state), return_dict=False
             )
             # Compute loss based on noise prediction
-            loss = 0.5 * F.mse_loss(noise_pred, noise, reduction="mean")
-            loss = loss / config.system.get("gradient_accumulation", 1)
+            text_to_image_loss = F.mse_loss(noise_pred, noise, reduction="mean")
             # p = encoder.proj_image(image_encoder_hidden_states)
-
-            if len(image_emb.shape) == 2: # POOLED case
-                image_emb = image_emb.view(image_emb.shape[0], 1, image_emb.shape[1])
             (noise_pred,) = unet(
-                noisy_latents, timesteps, image_emb, return_dict=False
+                noisy_latents, timesteps, clip.visual_projection2(image_out.last_hidden_state), return_dict=False
             )
             # Compute loss based on noise prediction
-            loss += 0.5  * F.mse_loss(noise_pred, noise, reduction="mean")
+            image_to_image_loss = F.mse_loss(noise_pred, noise, reduction="mean")
+
+
+            clip_loss_value = clip_loss(
+                clip.visual_projection(image_out.pooler_output), 
+                clip.text_projection(text_out.pooler_output), 
+                clip.logit_scale, 
+                output_dict=False
+            )
+            loss = (
+                    text_to_image_loss * config.system.text_to_image_loss_weight + 
+                    image_to_image_loss * config.system.image_to_image_loss_weight + 
+                    clip_loss_value * config.system.clip_loss_weight 
+            )
             loss = loss / config.system.get("gradient_accumulation", 1)
 
         # Accumulate gradients
@@ -486,6 +513,9 @@ def main():
             wandb.log(
                 {
                     "step_loss": loss.detach().item(),
+                    "image_to_image_loss": image_to_image_loss.detach().item(),
+                    "text_to_image_loss": text_to_image_loss.detach().item(),
+                    "clip_loss": clip_loss_value.detach().item(),
                     "lr": lr_scheduler.current_lr(),
                     "iter": step,
                     "images/sec": images_per_second_per_gpu * config.system.world_size,
@@ -498,6 +528,9 @@ def main():
                 f"[{num_examples_seen}/{config.experiment.num_examples_to_see}] "
                 f"({100*num_examples_seen/config.experiment.num_examples_to_see:0.2f}%): "
                 f" Loss: {loss.item():0.4f}"
+                f" Image-to-Image Loss: {image_to_image_loss.item():0.4f}"
+                f" Text-to-Image Loss: {text_to_image_loss.item():0.4f}"
+                f" CLIP Loss: {clip_loss_value.item():0.4f}"
                 f" Step: {step}"
                 f" im/s/GPU: {images_per_second_per_gpu:0.2f}"
             )
@@ -510,8 +543,7 @@ def main():
                 current_pipeline_path,
                 vae,
                 tokenizer,
-                text_encoder,
-                image_encoder,
+                clip,
                 unet,
                 ema_unet,
                 optimizer,
@@ -528,8 +560,7 @@ def main():
         save_model(
             config=config,
             unet=unet.module,
-            text_encoder=text_encoder,
-            image_encoder=image_encoder,
+            clip=clip,
             vae=vae,
             tokenizer=tokenizer,
             optimizer=optimizer,
@@ -544,8 +575,7 @@ def validate_and_save_model(
     current_pipeline_path,
     vae,
     tokenizer,
-    text_encoder,
-    image_encoder,
+    clip,
     unet,
     ema_unet,
     optimizer,
@@ -562,7 +592,7 @@ def validate_and_save_model(
 
     generate_examples(
         config,
-        text_encoder=text_encoder,
+        text_encoder=clip.text_model,
         vae=vae,
         unet=unet,
         tokenizer=tokenizer,
@@ -600,8 +630,7 @@ def validate_and_save_model(
         save_model(
             config=config,
             unet=unet.module,
-            text_encoder=text_encoder,
-            image_encoder=image_encoder,
+            clip=clip,
             vae=vae,
             tokenizer=tokenizer,
             optimizer=optimizer,
@@ -680,8 +709,7 @@ def save_model(
     unet,
     vae,
     tokenizer,
-    text_encoder,
-    image_encoder,
+    clip,
     optimizer,
     save_path,
     step,
@@ -693,8 +721,7 @@ def save_model(
 
     scheduler = maybe_load_model(config, "noise_scheduler_inference", subfolder="scheduler", default_model_factory=PNDMScheduler)
     pipeline = StableDiffusionPipelineExt(
-        text_encoder=text_encoder,
-        image_encoder=image_encoder,
+        clip=clip,
         vae=vae,
         unet=unet,
         tokenizer=tokenizer,
