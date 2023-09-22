@@ -584,6 +584,23 @@ def main():
         )
 
 
+class TextEncoderWrapper:
+
+    def __init__(self, config, clip):
+        self.config = config
+        self.clip = clip
+        self.dtype = self.clip.dtype
+    
+    def __call__(self, x, attention_mask=None):
+        if self.config.system.use_pooled_for_conditioning:
+            x =  self.clip.text_projection2(self.clip.text_model(x, attention_mask=attention_mask).pooler_output)
+            x = x.view(x.shape[0], 1, x.shape[1])
+        else:
+            x =  self.clip.text_projection2(self.clip.text_model(x, attention_mask=attention_mask).last_hidden_state)
+        #print(x.shape, self.config.system.use_pooled_for_conditioning)
+        x = x.view(1, x.shape[0], x.shape[1], x.shape[2])
+        return x
+
 def validate_and_save_model(
     config,
     current_pipeline_path,
@@ -603,11 +620,10 @@ def validate_and_save_model(
     if ema_unet is not None:
         ema_unet.store(unet.parameters())
         ema_unet.copy_to(unet.parameters())
-    text_encoder = CLIPTextModel.from_pretrained("sd1.5/text_encoder")
-    text_encoder.text_model = clip.text_model
+       
     generate_examples(
         config,
-        text_encoder=text_encoder,
+        text_encoder=TextEncoderWrapper(config, clip),
         vae=vae,
         unet=unet,
         tokenizer=tokenizer,

@@ -7,7 +7,7 @@ system:
     gradient_accumulation: 1
     batch_size: 64
     workers: 4
-    use_pooled_for_conditioning: True
+    use_pooled_for_conditioning: False
     image_to_image_loss_weight: 0.5
     text_to_image_loss_weight: 0.5
     clip_loss_weight: 0
@@ -20,7 +20,7 @@ distributed:
 
 experiment:
     log_dir: ./logs
-    name: "exp1"
+    name: "exp2"
     project: "stable-diffusion"
     num_examples_to_see: 1400000000
     save_every: 10000
