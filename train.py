@@ -92,58 +92,6 @@ class StableDiffusionPipelineExt(StableDiffusionPipeline):
             clip=clip,
         )
 
-def encode_image(self, x, normalize: bool = False, full=False):
-    self = self.visual
-    self.input_patchnorm = False
-    # to patches - whether to use dual patchnorm - https://arxiv.org/abs/2302.01327v1
-    if self.input_patchnorm:
-        # einops - rearrange(x, 'b c (h p1) (w p2) -> b (h w) (c p1 p2)')
-        x = x.reshape(x.shape[0], x.shape[1], self.grid_size[0], self.patch_size[0], self.grid_size[1], self.patch_size[1])
-        x = x.permute(0, 2, 4, 1, 3, 5)
-        x = x.reshape(x.shape[0], self.grid_size[0] * self.grid_size[1], -1)
-        x = self.patchnorm_pre_ln(x)
-        x = self.conv1(x)
-    else:
-        x = self.conv1(x)  # shape = [*, width, grid, grid]
-        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
-        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
-
-    # class embeddings and positional embeddings
-    x = torch.cat(
-        [self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device),
-         x], dim=1)  # shape = [*, grid ** 2 + 1, width]
-    x = x + self.positional_embedding.to(x.dtype)
-
-    # a patch_dropout of 0. would mean it is disabled and this function would do nothing but return what was passed in
-    x = self.patch_dropout(x)
-    x = self.ln_pre(x)
-
-    x = x.permute(1, 0, 2)  # NLD -> LND
-    x = self.transformer(x)
-    x = x.permute(1, 0, 2)  # LND -> NLD
-
-    pooled, tokens = self._global_pool(x)
-    pooled = self.ln_post(pooled)
-
-    if self.proj is not None:
-        pooled = pooled @ self.proj
-
-    return pooled, tokens
-
-
-def encode_text(self, text, normalize: bool = False, full=False):
-    cast_dtype = self.transformer.get_cast_dtype()
-    x = self.token_embedding(text).to(cast_dtype)  # [batch_size, n_ctx, d_model]
-    x = x + self.positional_embedding.to(cast_dtype)
-    x = x.permute(1, 0, 2)  # NLD -> LND
-    x = self.transformer(x, attn_mask=self.attn_mask)
-    x = x.permute(1, 0, 2)  # LND -> NLD
-    x = self.ln_final(x)  # [batch_size, n_ctx, transformer.width]
-    tokens = x
-    x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
-    return F.normalize(x, dim=-1) if normalize else x, tokens
-
-
 
 def set_seed(seed):
     np.random.seed(seed)
@@ -487,10 +435,10 @@ def main():
 
             if config.system.clip_loss_weight  > 0:
                 clip_loss_value = clip_loss(
-                    clip.visual_projection(image_out.pooler_output), 
-                    clip.text_projection(text_out.pooler_output), 
+                    F.normalize(clip.visual_projection(image_out.pooler_output), dim=1), 
+                    F.normalize(clip.text_projection(text_out.pooler_output), dim=1), 
                     clip.logit_scale, 
-                    output_dict=False
+                    output_dict=False,
                 )
             else:
                 clip_loss_value = torch.tensor(0.0)
