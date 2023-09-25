@@ -71,8 +71,21 @@ class CLIPCustom(CLIPModel):
 
     def __init__(self, config, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
-        self.visual_projection2 = deepcopy(self.visual_projection)
-        self.text_projection2 = deepcopy(self.text_projection)
+        self.visual_projection2 = torch.nn.Linear(self.visual_projection.in_features, self.visual_projection.out_features)
+        self.text_projection2 = torch.nn.Linear(self.text_projection.in_features, self.text_projection.out_features)
+
+    
+    def forward(self, image, text):
+        image_out = self.vision_model(image)
+        text_out = self.text_model(text)
+
+        image_out.pooler_output = self.visual_projection2(image_out.pooler_output)
+        image_out.last_hidden_state = self.visual_projection(image_out.last_hidden_state)
+
+        text_out.pooler_output = self.text_projection2(text_out.pooler_output)
+        text_out.last_hidden_state = self.text_projection(text_out.last_hidden_state)
+        return image_out, text_out, self.logit_scale.exp()
+
 
 class StableDiffusionPipelineExt(StableDiffusionPipeline):
     def __init__(
@@ -102,6 +115,11 @@ def set_seed(seed):
     cudnn.benchmark = False
 
 from contrastive_loss import ClipLoss
+def unwrap_model(model):
+    if hasattr(model, 'module'):
+        return model.module
+    else:
+        return model
 
 
 def main():
@@ -213,25 +231,11 @@ def main():
     tokenizer = maybe_load_model(
         config, "tokenizer", default_model_factory=CLIPTokenizer
     )
-    #import open_clip 
-    #encoder, _, preprocess = open_clip.create_model_and_transforms('ViT-L-14', pretrained='openai')
-    #encoder.proj_text = torch.nn.Linear(768, 768)
-    #encoder.proj_image = torch.nn.Linear(1024, 768)
-    #encoder = encoder.to(device)
-    
-    """
-    text_encoder = maybe_load_model(
-         config, "text_encoder", default_model_factory=CLIPTextModel
-     ).to(device, dtype=torch.float32)
-    image_encoder = maybe_load_model(
-         config, "image_encoder", default_model_factory=CLIPVisionModel
-     ).to(device, dtype=torch.float32)
-    """
 
     clip =  maybe_load_model(
          config, "clip", default_model_factory=CLIPCustom,
      ).to(device, dtype=torch.float32)
-    # UNet is trainable, need to apply DDP, gradient checkpointing, etc.
+
     unet = maybe_load_model(
         config, "unet", default_model_factory=UNet2DConditionModel
     ).to(device, dtype=torch.float32)
@@ -240,15 +244,17 @@ def main():
         # TODO (vkramanuj) Maybe fairscale would be more memory efficient
         # TODO (vkramanuj) Apply FSDP from fairscale
         unet.enable_gradient_checkpointing()
-        #clip.enable_gradient_checkpointing()
+        clip.gradient_checkpointing_enable()
         log_if_global_master("Enabling gradient checkpointing")
 
     if config.model.get("xformers", False):
         unet.enable_xformers_memory_efficient_attention()
         log_if_global_master("Enabling xformers efficient attention")
+    train_unet =  config.system.image_to_image_loss_weight > 0 or config.system.text_to_image_loss_weight > 0
 
-    unet = DistributedDataParallel(unet, device_ids=[device])
-
+    if train_unet:
+        unet = DistributedDataParallel(unet, device_ids=[device], static_graph=True)
+    clip = DistributedDataParallel(clip, device_ids=[device], find_unused_parameters=True, static_graph=True)
     # Freeze vae and text_encoder
     vae.requires_grad_(False)
     # text_encoder.requires_grad_(False)
@@ -293,7 +299,20 @@ def main():
     )
 
     # GETTING OPTIMIZER & LR SCHEDULER
-    optimizer = get_optimizer(unet, **config.optimizer.params)
+
+    if train_unet:
+        model_full = {
+          "unet": unet,
+          "clip": clip,
+        }
+    else:
+        model_full = {
+            "clip": clip,
+        }
+    model_full = torch.nn.ModuleDict(
+        model_full
+    )
+    optimizer = get_optimizer(model_full, **config.optimizer.params)
 
     if optimizer_state_dict:
         optimizer.load_state_dict(optimizer_state_dict)
@@ -343,8 +362,8 @@ def main():
         # Save model in the diffusers format
         save_model(
             config=config,
-            unet=unet.module,
-            clip=clip,
+            unet=unet.module if hasattr(unet, "module") else unet,
+            clip=clip.module,
             vae=vae,
             tokenizer=tokenizer,
             optimizer=optimizer,
@@ -368,76 +387,75 @@ def main():
         rank=config.system.global_rank,
         world_size=config.system.world_size,
     )
-    for batch in train_dataset.loader:
-        unet.train()
+    unet.train()
+    clip.train()
 
+    for batch in train_dataset.loader:
+  
         lr = lr_scheduler.step(step // config.system.get("gradient_accumulation", 1))
         num_examples_seen = step * effective_batch_size
 
         # Main training loop
         with torch.autocast(device_type="cuda", dtype=weight_dtype):
             # Compute clean and noised targets, no gradients needed (text_encoder frozen)
-            image_out = clip.vision_model(batch["pixel_values"].to(device))
-            text_out = clip.text_model(batch["input_ids"].to(device))
+            image_out, text_out, logit_scale = clip(batch["pixel_values"].to(device), batch["input_ids"].to(device))
+            if train_unet:
+                with torch.no_grad():
+                    # Ground-truth image latent, no noise
+                    #image_emb, image_encoder_hidden_states = encode_image(encoder, batch["pixel_values"].to(device))
+                    latents = vae.encode(
+                        batch["pixel_values"].to(device)
+                    ).latent_dist.sample()
 
-            with torch.no_grad():
-                # Ground-truth image latent, no noise
-                #image_emb, image_encoder_hidden_states = encode_image(encoder, batch["pixel_values"].to(device))
-                latents = vae.encode(
-                    batch["pixel_values"].to(device)
-                ).latent_dist.sample()
+                    # Scaling latents for UNet (noise and latent should have similar norms)
+                    latents = latents * 0.18215
 
-                # Scaling latents for UNet (noise and latent should have similar norms)
-                latents = latents * 0.18215
+                    # Sample noise to predict
+                    noise = torch.randn_like(latents)
+                    bsz = latents.shape[0]
 
-                # Sample noise to predict
-                noise = torch.randn_like(latents)
-                bsz = latents.shape[0]
+                    # Sample forward diffusion process timestep
+                    timesteps = torch.randint(
+                        0,
+                        noise_scheduler.num_train_timesteps,
+                        (bsz,),
+                        device=latents.device,
+                    )
+                    timesteps = timesteps.long()
 
-                # Sample forward diffusion process timestep
-                timesteps = torch.randint(
-                    0,
-                    noise_scheduler.num_train_timesteps,
-                    (bsz,),
-                    device=latents.device,
+                    # Compute noisy target based on timestep
+                    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+                if config.system.use_pooled_for_conditioning:
+                    text_embs = (text_out.pooler_output)
+                    text_embs = text_embs.view(text_embs.shape[0], 1, text_embs.shape[1])
+                else:
+                    text_embs = (text_out.last_hidden_state)
+                (noise_pred,) = unet(
+                    noisy_latents, timesteps, text_embs, return_dict=False
                 )
-                timesteps = timesteps.long()
-
-                # Compute noisy target based on timestep
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-                # Compute text conditioning
-                #text_emb, text_encoder_hidden_states = encode_text(encoder, batch["input_ids"].to(device))
-            # print(text_encoder_hidden_states.shape, image_encoder_hidden_states.shape)
-            # Noise prediction
-            # p = encoder.proj_text(text_encoder_hidden_states)
-            if config.system.use_pooled_for_conditioning:
-                text_embs = clip.text_projection2(text_out.pooler_output)
-                text_embs = text_embs.view(text_embs.shape[0], 1, text_embs.shape[1])
+                # Compute loss based on noise prediction
+                text_to_image_loss = F.mse_loss(noise_pred, noise, reduction="mean")
+                # p = encoder.proj_image(image_encoder_hidden_states)
+                if config.system.use_pooled_for_conditioning:
+                    image_embs = (image_out.pooler_output)
+                    image_embs = image_embs.view(image_embs.shape[0], 1, image_embs.shape[1])
+                else:
+                    image_embs = (image_out.last_hidden_state)
+                (noise_pred,) = unet(
+                    noisy_latents, timesteps, image_embs, return_dict=False
+                )
+                # Compute loss based on noise prediction
+                image_to_image_loss = F.mse_loss(noise_pred, noise, reduction="mean")
             else:
-                text_embs = clip.text_projection2(text_out.last_hidden_state)
-            (noise_pred,) = unet(
-                noisy_latents, timesteps, text_embs, return_dict=False
-            )
-            # Compute loss based on noise prediction
-            text_to_image_loss = F.mse_loss(noise_pred, noise, reduction="mean")
-            # p = encoder.proj_image(image_encoder_hidden_states)
-            if config.system.use_pooled_for_conditioning:
-                image_embs = clip.visual_projection2(image_out.pooler_output)
-                image_embs = image_embs.view(image_embs.shape[0], 1, image_embs.shape[1])
-            else:
-                image_embs = clip.visual_projection2(image_out.last_hidden_state)
-            (noise_pred,) = unet(
-                noisy_latents, timesteps, image_embs, return_dict=False
-            )
-            # Compute loss based on noise prediction
-            image_to_image_loss = F.mse_loss(noise_pred, noise, reduction="mean")
-
+                text_to_image_loss = torch.tensor(0.0)
+                image_to_image_loss = torch.tensor(0.0)
+            
             if config.system.clip_loss_weight  > 0:
                 clip_loss_value = clip_loss(
-                    F.normalize(clip.visual_projection(image_out.pooler_output), dim=1), 
-                    F.normalize(clip.text_projection(text_out.pooler_output), dim=1), 
-                    clip.logit_scale, 
+                    F.normalize(image_out.pooler_output, dim=1), 
+                    F.normalize(text_out.pooler_output, dim=1), 
+                    logit_scale, 
                     output_dict=False,
                 )
             else:
@@ -461,6 +479,10 @@ def main():
         # Only do a gradient step when we accumulate for enough iterations
         if grad_steps % config.system.get("gradient_accumulation", 1) == 0:
             optimizer.step()
+            if config.system.clip_loss_weight > 0:
+                with torch.no_grad():
+                    unwrap_model(clip).logit_scale.clamp_(0, math.log(100))
+
             optimizer.zero_grad()
 
             if config.model.use_ema:
@@ -471,6 +493,7 @@ def main():
         # Log to WandB and log_dir/exp_name/logs.txt
         if dist_utils.is_global_master(config) and step % 40 == 0:
             images_per_second_per_gpu = examples_since_last_logged / (time.time() - now)
+            logit_scale_scalar = logit_scale.item()
 
             wandb.log(
                 {
@@ -478,6 +501,7 @@ def main():
                     "image_to_image_loss": image_to_image_loss.detach().item(),
                     "text_to_image_loss": text_to_image_loss.detach().item(),
                     "clip_loss": clip_loss_value.detach().item(),
+                    "logit_scale": logit_scale_scalar,
                     "lr": lr_scheduler.current_lr(),
                     "iter": step,
                     "images/sec": images_per_second_per_gpu * config.system.world_size,
@@ -485,14 +509,14 @@ def main():
                 },
                 step=step,
             )
-
             logging.info(
                 f"[{num_examples_seen}/{config.experiment.num_examples_to_see}] "
                 f"({100*num_examples_seen/config.experiment.num_examples_to_see:0.2f}%): "
                 f" Loss: {loss.item():0.4f}"
                 f" Image-to-Image Loss: {image_to_image_loss.item():0.4f}"
                 f" Text-to-Image Loss: {text_to_image_loss.item():0.4f}"
-                f" CLIP Loss: {clip_loss_value.item():0.4f}"
+                f" CLIP-Loss: {clip_loss_value.item():0.4f}"
+                f" Logit-Scale: {logit_scale_scalar:0.4f}"
                 f" Step: {step}"
                 f" im/s/GPU: {images_per_second_per_gpu:0.2f}"
             )
@@ -521,7 +545,7 @@ def main():
         save_path = Path(config.experiment.folder) / "final"
         save_model(
             config=config,
-            unet=unet.module,
+            unet=unet.module if hasattr(unet, "module") else unet,
             clip=clip,
             vae=vae,
             tokenizer=tokenizer,
@@ -571,7 +595,7 @@ def validate_and_save_model(
        
     generate_examples(
         config,
-        text_encoder=TextEncoderWrapper(config, clip),
+        text_encoder=TextEncoderWrapper(config, clip.module),
         vae=vae,
         unet=unet,
         tokenizer=tokenizer,
@@ -609,7 +633,7 @@ def validate_and_save_model(
         save_model(
             config=config,
             unet=unet.module,
-            clip=clip,
+            clip=clip.module,
             vae=vae,
             tokenizer=tokenizer,
             optimizer=optimizer,
@@ -740,7 +764,8 @@ def generate_examples(
     resolution=512,
 ):
     # Make sure num_examples to generate is divisible by world_size
-    num_examples = num_examples // config.system.world_size * config.system.world_size
+    if hasattr(config.system, "world_size"):
+        num_examples = num_examples // config.system.world_size * config.system.world_size
 
     text_db = pd.read_csv(caption_file)
     text_db = text_db.iloc[:num_examples, :]
@@ -748,7 +773,7 @@ def generate_examples(
     pipeline = StableDiffusionPipeline(
         vae=vae,
         text_encoder=text_encoder,
-        unet=unet.module,
+        unet=unet.module if hasattr(unet, "module") else unet,
         tokenizer=tokenizer,
         safety_checker=None,
         feature_extractor=None,
