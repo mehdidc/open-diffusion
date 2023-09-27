@@ -253,7 +253,7 @@ def main():
     train_unet =  config.system.image_to_image_loss_weight > 0 or config.system.text_to_image_loss_weight > 0
 
     if train_unet:
-        unet = DistributedDataParallel(unet, device_ids=[device], static_graph=True)
+        unet = DistributedDataParallel(unet, device_ids=[device])
     clip = DistributedDataParallel(clip, device_ids=[device], find_unused_parameters=True, static_graph=True)
     # Freeze vae and text_encoder
     vae.requires_grad_(False)
@@ -632,7 +632,7 @@ def validate_and_save_model(
         # Save model
         save_model(
             config=config,
-            unet=unet.module,
+            unet=unet.module if hasattr(unet, "module") else unet,
             clip=clip.module,
             vae=vae,
             tokenizer=tokenizer,
