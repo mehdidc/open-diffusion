@@ -85,6 +85,14 @@ class CLIPCustom(CLIPModel):
         text_out.pooler_output = self.text_projection2(text_out.pooler_output)
         text_out.last_hidden_state = self.text_projection(text_out.last_hidden_state)
         return image_out, text_out, self.logit_scale.exp()
+    
+    def encode_text(self, text):
+        text_out = self.text_model(text)
+        return self.text_projection2(text_out.pooler_output)
+    
+    def encode_image(self, image):
+        image_out = self.vision_model(image)
+        return self.visual_projection2(image_out.pooler_output)
 
 
 class StableDiffusionPipelineExt(StableDiffusionPipeline):
@@ -251,10 +259,11 @@ def main():
         unet.enable_xformers_memory_efficient_attention()
         log_if_global_master("Enabling xformers efficient attention")
     train_unet =  config.system.image_to_image_loss_weight > 0 or config.system.text_to_image_loss_weight > 0
-
+    train_clip = config.system.clip_loss_weight > 0
     if train_unet:
         unet = DistributedDataParallel(unet, device_ids=[device])
-    clip = DistributedDataParallel(clip, device_ids=[device], find_unused_parameters=True, static_graph=True)
+    if train_clip:
+        clip = DistributedDataParallel(clip, device_ids=[device], find_unused_parameters=True, static_graph=True)
     # Freeze vae and text_encoder
     vae.requires_grad_(False)
     # text_encoder.requires_grad_(False)
@@ -363,7 +372,7 @@ def main():
         save_model(
             config=config,
             unet=unet.module if hasattr(unet, "module") else unet,
-            clip=clip.module,
+            clip=clip.module if hasattr(clip, "module") else clip,
             vae=vae,
             tokenizer=tokenizer,
             optimizer=optimizer,
@@ -546,7 +555,7 @@ def main():
         save_model(
             config=config,
             unet=unet.module if hasattr(unet, "module") else unet,
-            clip=clip,
+            clip=clip.module if hasattr(clip, "module") else clip,
             vae=vae,
             tokenizer=tokenizer,
             optimizer=optimizer,
@@ -595,7 +604,7 @@ def validate_and_save_model(
        
     generate_examples(
         config,
-        text_encoder=TextEncoderWrapper(config, clip.module),
+        text_encoder=TextEncoderWrapper(config, clip.module if hasattr(clip, "module") else clip),
         vae=vae,
         unet=unet,
         tokenizer=tokenizer,
@@ -633,7 +642,7 @@ def validate_and_save_model(
         save_model(
             config=config,
             unet=unet.module if hasattr(unet, "module") else unet,
-            clip=clip.module,
+            clip=clip.module if hasattr(clip, "module") else clip,
             vae=vae,
             tokenizer=tokenizer,
             optimizer=optimizer,

@@ -150,7 +150,7 @@ def generate_examples(
 
 device = "cuda"
 config = get_config()
-config.model.pretrained = "logs/exp1/current_pipeline"
+config.model.pretrained = "logs/exp6/current_pipeline"
 vae = maybe_load_model(config, "vae", default_model_factory=AutoencoderKL).to(
     device, dtype=torch.float32
 )
@@ -175,23 +175,8 @@ dataloader = torch.utils.data.DataLoader(
     dataset.batched(batch_size), batch_size=None, 
     shuffle=False, num_workers=4,
 )
-
-class Wrapper:
-
-    def __init__(self, clip):
-        self.clip = clip
-    
-    def encode_image(self, image):
-        image_out = self.clip.vision_model(image)
-        return self.clip.visual_projection2(image_out.pooler_output)
-    
-    def encode_text(self, text):
-        text_out = self.clip.text_model(text)
-        return self.clip.text_projection2(text_out.pooler_output)
-
 classnames = dataset.classes
 templates = dataset.templates
-clip = Wrapper(clip)
 import open_clip
 results = zeroshot_classification.evaluate(
     clip,
