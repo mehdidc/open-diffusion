@@ -150,7 +150,7 @@ def generate_examples(
 
 device = "cuda"
 config = get_config()
-config.model.pretrained = "logs/exp6/current_pipeline"
+config.model.pretrained = f"logs/{config.experiment.name}/current_pipeline"
 vae = maybe_load_model(config, "vae", default_model_factory=AutoencoderKL).to(
     device, dtype=torch.float32
 )
