@@ -158,8 +158,9 @@ clip = maybe_load_model(
 unet = maybe_load_model(
     config, "unet", default_model_factory=UNet2DConditionModel
 ).to(device, dtype=torch.float32)
+print(unet)
 captions = [
-    "an orange fruit in a table",
+    "an chair",
 ] * 8
 nb = len(captions)
 out = "out"

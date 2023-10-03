@@ -10,7 +10,7 @@ system:
     use_pooled_for_conditioning: False
     image_to_image_loss_weight: 0.5
     text_to_image_loss_weight: 0.5
-    clip_loss_weight: 0.1
+    clip_loss_weight: 0
     dist_backend: ${distributed.dist_backend}
     dist_url: ${distributed.dist_url}
 

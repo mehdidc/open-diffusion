@@ -264,6 +264,8 @@ def main():
         unet = DistributedDataParallel(unet, device_ids=[device])
     if train_clip:
         clip = DistributedDataParallel(clip, device_ids=[device], find_unused_parameters=True, static_graph=True)
+    if config.system.get("freeze_unet", False):
+        unet.requires_grad_(False)
     # Freeze vae and text_encoder
     vae.requires_grad_(False)
     # text_encoder.requires_grad_(False)
@@ -815,7 +817,7 @@ def generate_examples(
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             out = pipeline(
                 list(text_raw),
-                guidance_scale=7.5,
+                guidance_scale=1,
                 generator=rng,
                 height=resolution,
                 width=resolution,
