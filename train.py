@@ -71,19 +71,24 @@ class CLIPCustom(CLIPModel):
 
     def __init__(self, config, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
-        self.visual_projection2 = torch.nn.Linear(self.visual_projection.in_features, self.visual_projection.out_features)
-        self.text_projection2 = torch.nn.Linear(self.text_projection.in_features, self.text_projection.out_features)
+        print(config)
+        out_dim = config.out_dim if hasattr(config, "out_dim") else None
+        print(out_dim)
+        self.visual_projection1 = torch.nn.Linear(self.visual_projection.in_features, out_dim if out_dim else self.visual_projection.out_features)
+        self.text_projection1 = torch.nn.Linear(self.text_projection.in_features, out_dim if out_dim else self.text_projection.out_features)
 
+        self.visual_projection2 = torch.nn.Linear(self.visual_projection.in_features, out_dim if out_dim else self.visual_projection.out_features)
+        self.text_projection2 = torch.nn.Linear(self.text_projection.in_features, out_dim if out_dim else self.text_projection.out_features)
     
     def forward(self, image, text):
         image_out = self.vision_model(image)
         text_out = self.text_model(text)
 
         image_out.pooler_output = self.visual_projection2(image_out.pooler_output)
-        image_out.last_hidden_state = self.visual_projection(image_out.last_hidden_state)
+        image_out.last_hidden_state = self.visual_projection1(image_out.last_hidden_state)
 
         text_out.pooler_output = self.text_projection2(text_out.pooler_output)
-        text_out.last_hidden_state = self.text_projection(text_out.last_hidden_state)
+        text_out.last_hidden_state = self.text_projection1(text_out.last_hidden_state)
         return image_out, text_out, self.logit_scale.exp()
     
     def encode_text(self, text):
@@ -128,6 +133,22 @@ def unwrap_model(model):
         return model.module
     else:
         return model
+
+
+class TokenizerForGuidance:
+
+
+    def __init__(self, tokenizer, prob):
+        self.tokenizer = tokenizer
+        self.prob = prob
+        self.model_max_length = tokenizer.model_max_length
+    
+    def __call__(self, text, *args: Any, **kwds: Any) -> Any:
+        if random.random() < self.prob:
+            text = ""
+        return self.tokenizer(text, *args, **kwds)
+
+
 
 
 def main():
@@ -239,6 +260,9 @@ def main():
     tokenizer = maybe_load_model(
         config, "tokenizer", default_model_factory=CLIPTokenizer
     )
+    if config.system.get("empty_text_proba", 0) > 0:
+        tokenizer = TokenizerForGuidance(tokenizer, config.system.empty_text_proba)
+        print(tokenizer)
 
     clip =  maybe_load_model(
          config, "clip", default_model_factory=CLIPCustom,
@@ -258,14 +282,20 @@ def main():
     if config.model.get("xformers", False):
         unet.enable_xformers_memory_efficient_attention()
         log_if_global_master("Enabling xformers efficient attention")
-    train_unet =  config.system.image_to_image_loss_weight > 0 or config.system.text_to_image_loss_weight > 0
-    train_clip = config.system.clip_loss_weight > 0
+    #train_unet =  config.system.image_to_image_loss_weight > 0 or config.system.text_to_image_loss_weight > 0
+    #train_clip = config.system.clip_loss_weight > 0
+    train_unet = config.system.train_unet
+    train_clip = config.system.train_clip
+    
     if train_unet:
         unet = DistributedDataParallel(unet, device_ids=[device])
+    else:
+        unet.requires_grad_(False)
     if train_clip:
         clip = DistributedDataParallel(clip, device_ids=[device], find_unused_parameters=True, static_graph=True)
-    if config.system.get("freeze_unet", False):
-        unet.requires_grad_(False)
+    else:
+        clip.requires_grad_(False)
+    
     # Freeze vae and text_encoder
     vae.requires_grad_(False)
     # text_encoder.requires_grad_(False)
@@ -301,6 +331,7 @@ def main():
     noise_scheduler = maybe_load_model(
         config, subtype="noise_scheduler_training", subfolder="scheduler", default_model_factory=DDPMScheduler)
     # GETTING TRAIN DATASET
+
     train_dataset = getattr(data, config.dataset.type)(
         rank=config.system.global_rank,
         num_processes=config.system.world_size,
@@ -817,7 +848,7 @@ def generate_examples(
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             out = pipeline(
                 list(text_raw),
-                guidance_scale=1,
+                guidance_scale=7.5,
                 generator=rng,
                 height=resolution,
                 width=resolution,

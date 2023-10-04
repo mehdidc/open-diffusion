@@ -6,6 +6,7 @@ import importlib
 
 
 def maybe_load_model(config, subtype, subfolder=None, default_model_factory=None):
+    
     if subfolder is None:
         subfolder = subtype
     model_factory = load_target(config.model.get(f"{subtype}.target"), default=default_model_factory)

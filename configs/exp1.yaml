@@ -1,3 +1,4 @@
+# use pre-trained clip b32, use pre-trained unet, and fine-tune everything
 wandb:
     api_key: null
     entity: null
@@ -7,9 +8,11 @@ system:
     gradient_accumulation: 1
     batch_size: 64
     workers: 4
-    use_pooled_for_conditioning: True
+    use_pooled_for_conditioning: False
     image_to_image_loss_weight: 0.5
     text_to_image_loss_weight: 0.5
+    train_unet: True
+    train_clip: True
     clip_loss_weight: 0
     dist_backend: ${distributed.dist_backend}
     dist_url: ${distributed.dist_url}
@@ -21,9 +24,9 @@ distributed:
 experiment:
     log_dir: ./logs
     name: "exp1"
-    project: "stable-diffusion"
+    project: "stable-diffusion-clip"
     num_examples_to_see: 1400000000
-    save_every: 10000
+    save_every: 5000
     requeue: True
     eval_caption_file: data/prompts/uid_caption.csv
     num_eval_images: 200
@@ -38,48 +41,22 @@ optimizer:
         epsilon: 0.00000001
 
 model:
-    pt_path: sd1.5
+    pt_path: pretrained/stable-diffusion-2-1
     vae:
         pretrained: ${model.pt_path}
     clip:
-        pretrained: ${model.pt_path}
-
+        pretrained: pretrained/clip_b32_openai_pretrained
     tokenizer:
         pretrained: ${model.pt_path}
-        
     noise_scheduler_training:
         pretrained: ${model.pt_path}
         target: DDPMNoiseScheduler
-
     noise_scheduler_inference:
         pretrained: ${model.pt_path}
         target: EulerDiscreteScheduler
-
     unet:
         target: UNet2DConditionModel
-        params:
-            act_fn: "silu"
-            attention_head_dim: 8
-            block_out_channels: [320, 640, 1280, 1280]
-            center_input_sample: False
-            cross_attention_dim: 512
-            down_block_types: ["CrossAttnDownBlock2D","CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "DownBlock2D"]
-            downsample_padding: 1
-            flip_sin_to_cos: true
-            freq_shift: 0
-            in_channels: 4
-            layers_per_block: 2
-            mid_block_scale_factor: 1
-            norm_eps: 1e-05
-            norm_num_groups: 32
-            out_channels: 4
-            sample_size: 32
-            up_block_types: [
-                "UpBlock2D",
-                "CrossAttnUpBlock2D",
-                "CrossAttnUpBlock2D",
-                "CrossAttnUpBlock2D"
-            ]
+        pretrained: ${model.pt_path}
     use_ema: True 
     mixed_precision: bf16
     gradient_checkpointing: True
