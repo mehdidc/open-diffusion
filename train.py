@@ -286,13 +286,24 @@ def main():
     #train_clip = config.system.clip_loss_weight > 0
     train_unet = config.system.train_unet
     train_clip = config.system.train_clip
-    
+
+    # not used
+    clip.visual_projection.requires_grad_(False)
+    clip.text_projection.requires_grad_(False)
+
+    # not used if not clip loss weight
+    if config.system.clip_loss_weight == 0:
+        clip.logit_scale.requires_grad_(False)
+        clip.visual_projection2.requires_grad_(False)
+        clip.text_projection2.requires_grad_(False)
+        clip.vision_model.post_layernorm.requires_grad_(False)
+
     if train_unet:
         unet = DistributedDataParallel(unet, device_ids=[device])
     else:
         unet.requires_grad_(False)
     if train_clip:
-        clip = DistributedDataParallel(clip, device_ids=[device], find_unused_parameters=True, static_graph=True)
+        clip = DistributedDataParallel(clip, device_ids=[device])
     else:
         clip.requires_grad_(False)
     
@@ -493,7 +504,7 @@ def main():
                 text_to_image_loss = torch.tensor(0.0)
                 image_to_image_loss = torch.tensor(0.0)
             
-            if config.system.clip_loss_weight  > 0:
+            if config.system.clip_loss_weight > 0:
                 clip_loss_value = clip_loss(
                     F.normalize(image_out.pooler_output, dim=1), 
                     F.normalize(text_out.pooler_output, dim=1), 

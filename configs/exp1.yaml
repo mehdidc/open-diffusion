@@ -1,4 +1,4 @@
-# use pre-trained clip b32, use pre-trained unet, and fine-tune everything
+# use pre-trained clip b32 with new projections, use pre-trained unet, and fine-tune everything
 wandb:
     api_key: null
     entity: null
