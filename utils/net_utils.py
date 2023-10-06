@@ -12,7 +12,6 @@ def maybe_load_model(config, subtype, subfolder=None, default_model_factory=None
     model_factory = load_target(config.model.get(f"{subtype}.target"), default=default_model_factory)
     if model_id := config.model.get("pretrained"):
         model = model_factory.from_pretrained(model_id, subfolder=subfolder)
-
     elif config.model.get(subtype, False) and (
         model_id := config.model.get(subtype).get("pretrained")
     ):

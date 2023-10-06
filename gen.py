@@ -40,6 +40,7 @@ from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
     PNDMScheduler,
+    DDIMScheduler,
     StableDiffusionPipeline,
 )
 
@@ -72,7 +73,8 @@ def generate_examples(
     text_encoder,
     vae,
     unet,
-    tokenizer,  
+    tokenizer,
+    scheduler,
     out_dir,
     caption_file,
     num_examples=1000,
@@ -93,9 +95,7 @@ def generate_examples(
         tokenizer=tokenizer,
         safety_checker=None,
         feature_extractor=None,
-        scheduler=PNDMScheduler.from_config(
-            "CompVis/stable-diffusion-v1-4", subfolder="scheduler"
-        ),
+        scheduler=scheduler,
         requires_safety_checker=False,  # for internal auditing only, enable in general
     ).to(device)
 
@@ -122,7 +122,6 @@ def generate_examples(
         rng = torch.Generator()
         rng.manual_seed(I)
         I += 1
-
         with torch.autocast(device_type="cuda"):
             out = pipeline(
                 list(text_raw),
@@ -130,6 +129,7 @@ def generate_examples(
                 generator=rng,
                 height=resolution,
                 width=resolution,
+                num_inference_steps=50,
             )
         images.extend(
             [
@@ -144,32 +144,35 @@ def generate_examples(
 device = "cuda"
 config = get_config()
 config.model.pretrained = f"logs/{config.experiment.name}/current_pipeline"
+#config.model.pretrained = "pretrained/stable-diffusion-2-1"
 vae = maybe_load_model(config, "vae", default_model_factory=AutoencoderKL).to(
     device, dtype=torch.float32
 )
 tokenizer = maybe_load_model(
     config, "tokenizer", default_model_factory=CLIPTokenizer
 )
-
 clip = maybe_load_model(
-         config, "clip", default_model_factory=CLIPCustom,
+    config, "clip", default_model_factory=CLIPCustom,
 ).to(device, dtype=torch.float32)
-
 unet = maybe_load_model(
     config, "unet", default_model_factory=UNet2DConditionModel
 ).to(device, dtype=torch.float32)
+scheduler = maybe_load_model(config, "noise_scheduler_inference", subfolder="scheduler", default_model_factory=PNDMScheduler)
+print(scheduler)
 captions = [
-    "A beach with two surf boards sitting on it.",
+    "a drawing of a green pokemon with red eyes",
 ] * 8
 nb = len(captions)
 out = "out"
 res = 224
+text_encoder = TextEncoderWrapper(config, clip)
 generate_examples(
     config,
-    TextEncoderWrapper(config, clip),
+    text_encoder,
     vae,
     unet,
     tokenizer,
+    scheduler,
     out,
     captions,
     num_examples=nb,

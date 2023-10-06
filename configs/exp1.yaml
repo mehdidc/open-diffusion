@@ -1,4 +1,4 @@
-# use pre-trained clip b32 with new projections, use pre-trained unet, and fine-tune everything
+# use pre-trained clip b32 with new projections, use pre-trained unet, and fine-tune everything on datacomp
 wandb:
     api_key: null
     entity: null
@@ -9,13 +9,14 @@ system:
     batch_size: 64
     workers: 4
     use_pooled_for_conditioning: False
-    image_to_image_loss_weight: 0.5
-    text_to_image_loss_weight: 0.5
+    image_to_image_loss_weight: 0
+    text_to_image_loss_weight: 1
     train_unet: True
     train_clip: True
     clip_loss_weight: 0
     dist_backend: ${distributed.dist_backend}
     dist_url: ${distributed.dist_url}
+    empty_text_proba: 0.2
 
 distributed:
     dist_backend: 'nccl'
@@ -25,7 +26,7 @@ experiment:
     log_dir: ./logs
     name: "exp1"
     project: "stable-diffusion-clip"
-    num_examples_to_see: 1400000000
+    num_examples_to_see: 1280000000
     save_every: 5000
     requeue: True
     eval_caption_file: data/prompts/uid_caption.csv
@@ -53,7 +54,7 @@ model:
         target: DDPMNoiseScheduler
     noise_scheduler_inference:
         pretrained: ${model.pt_path}
-        target: EulerDiscreteScheduler
+        target: DDIMScheduler
     unet:
         target: UNet2DConditionModel
         pretrained: ${model.pt_path}
