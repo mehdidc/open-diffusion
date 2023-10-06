@@ -40,6 +40,7 @@ from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
     PNDMScheduler,
+    DDIMScheduler,
     StableDiffusionPipeline,
 )
 
@@ -71,15 +72,19 @@ class CLIPCustom(CLIPModel):
 
     def __init__(self, config, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
-        print(config)
         out_dim = config.out_dim if hasattr(config, "out_dim") else None
-        print(out_dim)
-        self.visual_projection1 = torch.nn.Linear(self.visual_projection.in_features, out_dim if out_dim else self.visual_projection.out_features)
-        self.text_projection1 = torch.nn.Linear(self.text_projection.in_features, out_dim if out_dim else self.text_projection.out_features)
+        proj1 = config.proj1 if hasattr(config, "proj1") else True
+        proj2 = config.proj2 if hasattr(config, "proj2") else True
+        print(proj1, proj2)
+        self.visual_projection1 = torch.nn.Linear(self.visual_projection.in_features, out_dim if out_dim else self.visual_projection.out_features) if proj1 else torch.nn.Sequential()
+        self.text_projection1 = torch.nn.Linear(self.text_projection.in_features, out_dim if out_dim else self.text_projection.out_features) if proj1 else torch.nn.Sequential()
 
-        self.visual_projection2 = torch.nn.Linear(self.visual_projection.in_features, out_dim if out_dim else self.visual_projection.out_features)
-        self.text_projection2 = torch.nn.Linear(self.text_projection.in_features, out_dim if out_dim else self.text_projection.out_features)
-    
+        self.visual_projection2 = torch.nn.Linear(self.visual_projection.in_features, out_dim if out_dim else self.visual_projection.out_features) if proj2 else torch.nn.Sequential()
+        self.text_projection2 = torch.nn.Linear(self.text_projection.in_features, out_dim if out_dim else self.text_projection.out_features) if proj2 else torch.nn.Sequential()
+
+        self.mean = torch.nn.Parameter(torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1))
+        self.std = torch.nn.Parameter(torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1))
+
     def forward(self, image, text):
         image_out = self.vision_model(image)
         text_out = self.text_model(text)
@@ -148,7 +153,8 @@ class TokenizerForGuidance:
             text = ""
         return self.tokenizer(text, *args, **kwds)
 
-
+    def tokenize(self, text, *args: Any, **kwds: Any) -> Any:
+        return self.tokenizer(text, *args, **kwds)
 
 
 def main():
@@ -261,9 +267,10 @@ def main():
         config, "tokenizer", default_model_factory=CLIPTokenizer
     )
     if config.system.get("empty_text_proba", 0) > 0:
-        tokenizer = TokenizerForGuidance(tokenizer, config.system.empty_text_proba)
+        tokenizer_guidance = TokenizerForGuidance(tokenizer, config.system.empty_text_proba)
         print(tokenizer)
-
+    else:
+        tokenizer_guidance
     clip =  maybe_load_model(
          config, "clip", default_model_factory=CLIPCustom,
      ).to(device, dtype=torch.float32)
@@ -342,26 +349,22 @@ def main():
     noise_scheduler = maybe_load_model(
         config, subtype="noise_scheduler_training", subfolder="scheduler", default_model_factory=DDPMScheduler)
     # GETTING TRAIN DATASET
-
+    print(noise_scheduler)
     train_dataset = getattr(data, config.dataset.type)(
         rank=config.system.global_rank,
         num_processes=config.system.world_size,
-        tokenizer=tokenizer,
+        tokenizer=tokenizer_guidance,
         train=True,
         **config.dataset.params,
     )
 
     # GETTING OPTIMIZER & LR SCHEDULER
 
+    model_full = {}
     if train_unet:
-        model_full = {
-          "unet": unet,
-          "clip": clip,
-        }
-    else:
-        model_full = {
-            "clip": clip,
-        }
+        model_full["unet"] = unet
+    if train_clip:
+        model_full["clip"] = clip
     model_full = torch.nn.ModuleDict(
         model_full
     )
@@ -442,7 +445,8 @@ def main():
     )
     unet.train()
     clip.train()
-
+    clip_mean = clip.module.mean if hasattr(clip, "module") else clip.mean
+    clip_std = clip.module.std if hasattr(clip, "module") else clip.std
     for batch in train_dataset.loader:
   
         lr = lr_scheduler.step(step // config.system.get("gradient_accumulation", 1))
@@ -451,7 +455,12 @@ def main():
         # Main training loop
         with torch.autocast(device_type="cuda", dtype=weight_dtype):
             # Compute clean and noised targets, no gradients needed (text_encoder frozen)
-            image_out, text_out, logit_scale = clip(batch["pixel_values"].to(device), batch["input_ids"].to(device))
+            
+            with torch.no_grad():
+                x = batch["pixel_values"].to(device)
+                x = (x+1)/2
+                x = (x - clip_mean) / clip_std 
+            image_out, text_out, logit_scale = clip(x, batch["input_ids"].to(device))
             if train_unet:
                 with torch.no_grad():
                     # Ground-truth image latent, no noise
@@ -478,7 +487,15 @@ def main():
 
                     # Compute noisy target based on timestep
                     noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+                    if noise_scheduler.config.prediction_type == "epsilon":
+                        target = noise
+                    elif noise_scheduler.config.prediction_type == "v_prediction":
+                        target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                    else:
+                        raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
+
+            if train_unet and config.system.text_to_image_loss_weight > 0:
                 if config.system.use_pooled_for_conditioning:
                     text_embs = (text_out.pooler_output)
                     text_embs = text_embs.view(text_embs.shape[0], 1, text_embs.shape[1])
@@ -487,8 +504,10 @@ def main():
                 (noise_pred,) = unet(
                     noisy_latents, timesteps, text_embs, return_dict=False
                 )
-                # Compute loss based on noise prediction
-                text_to_image_loss = F.mse_loss(noise_pred, noise, reduction="mean")
+                text_to_image_loss = F.mse_loss(noise_pred, target, reduction="mean")
+            else:
+                text_to_image_loss = torch.tensor(0.0)
+            if train_unet and config.system.image_to_image_loss_weight > 0:
                 # p = encoder.proj_image(image_encoder_hidden_states)
                 if config.system.use_pooled_for_conditioning:
                     image_embs = (image_out.pooler_output)
@@ -499,9 +518,8 @@ def main():
                     noisy_latents, timesteps, image_embs, return_dict=False
                 )
                 # Compute loss based on noise prediction
-                image_to_image_loss = F.mse_loss(noise_pred, noise, reduction="mean")
+                image_to_image_loss = F.mse_loss(noise_pred, target, reduction="mean")
             else:
-                text_to_image_loss = torch.tensor(0.0)
                 image_to_image_loss = torch.tensor(0.0)
             
             if config.system.clip_loss_weight > 0:
@@ -514,9 +532,9 @@ def main():
             else:
                 clip_loss_value = torch.tensor(0.0)
             loss = (
-                    text_to_image_loss * config.system.text_to_image_loss_weight + 
-                    image_to_image_loss * config.system.image_to_image_loss_weight + 
-                    clip_loss_value * config.system.clip_loss_weight 
+                text_to_image_loss * config.system.text_to_image_loss_weight + 
+                image_to_image_loss * config.system.image_to_image_loss_weight + 
+                clip_loss_value * config.system.clip_loss_weight 
             )
             loss = loss / config.system.get("gradient_accumulation", 1)
 
@@ -618,11 +636,10 @@ class TextEncoderWrapper:
     
     def __call__(self, x, attention_mask=None):
         if self.config.system.use_pooled_for_conditioning:
-            x =  self.clip.text_projection2(self.clip.text_model(x, attention_mask=attention_mask).pooler_output)
+            x =  self.clip.text_projection1(self.clip.text_model(x, attention_mask=attention_mask).pooler_output)
             x = x.view(x.shape[0], 1, x.shape[1])
         else:
-            x =  self.clip.text_projection2(self.clip.text_model(x, attention_mask=attention_mask).last_hidden_state)
-        #print(x.shape, self.config.system.use_pooled_for_conditioning)
+            x =  self.clip.text_projection1(self.clip.text_model(x, attention_mask=attention_mask).last_hidden_state)
         x = x.view(1, x.shape[0], x.shape[1], x.shape[2])
         return x
 
@@ -645,13 +662,14 @@ def validate_and_save_model(
     if ema_unet is not None:
         ema_unet.store(unet.parameters())
         ema_unet.copy_to(unet.parameters())
-       
+    scheduler = maybe_load_model(config, "noise_scheduler_inference", subfolder="scheduler", default_model_factory=DDIMScheduler)
     generate_examples(
         config,
         text_encoder=TextEncoderWrapper(config, clip.module if hasattr(clip, "module") else clip),
         vae=vae,
         unet=unet,
         tokenizer=tokenizer,
+        scheduler=scheduler,
         out_dir=out_dir,
         num_examples=config.experiment.get("num_eval_images", 1000),
         caption_file=config.experiment.get(
@@ -775,7 +793,7 @@ def save_model(
         ema_unet.store(unet.parameters())
         ema_unet.copy_to(unet.parameters())
 
-    scheduler = maybe_load_model(config, "noise_scheduler_inference", subfolder="scheduler", default_model_factory=PNDMScheduler)
+    scheduler = maybe_load_model(config, "noise_scheduler_inference", subfolder="scheduler", default_model_factory=DDIMScheduler)
     pipeline = StableDiffusionPipelineExt(
         clip=clip,
         vae=vae,
@@ -811,6 +829,7 @@ def generate_examples(
     vae,
     unet,
     tokenizer,
+    scheduler,
     out_dir,
     caption_file,
     num_examples=1000,
@@ -830,9 +849,7 @@ def generate_examples(
         tokenizer=tokenizer,
         safety_checker=None,
         feature_extractor=None,
-        scheduler=PNDMScheduler.from_config(
-            "CompVis/stable-diffusion-v1-4", subfolder="scheduler"
-        ),
+        scheduler=scheduler,
         requires_safety_checker=False,  # for internal auditing only, enable in general
     ).to(config.system.local_rank)
 
