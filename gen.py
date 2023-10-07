@@ -160,7 +160,7 @@ unet = maybe_load_model(
 scheduler = maybe_load_model(config, "noise_scheduler_inference", subfolder="scheduler", default_model_factory=PNDMScheduler)
 print(scheduler)
 captions = [
-    "a drawing of a green pokemon with red eyes",
+    "a chair in the form of an avocado",
 ] * 8
 nb = len(captions)
 out = "out"

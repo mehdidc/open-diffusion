@@ -8,13 +8,21 @@ import os
 def get_optimizer(
     model, learning_rate, beta1, beta2, weight_decay, epsilon 
 ):
-    return torch.optim.AdamW(
-        model.parameters(),
-        lr=learning_rate,
+    if type(model) == list:
+        return torch.optim.AdamW(
+        model,
         betas=(beta1, beta2),
         weight_decay=weight_decay,
         eps=epsilon,
     )
+    else:     
+        return torch.optim.AdamW(
+            model.parameters(),
+            lr=learning_rate,
+            betas=(beta1, beta2),
+            weight_decay=weight_decay,
+            eps=epsilon,
+        )
 
 
 def get_config():

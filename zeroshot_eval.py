@@ -71,6 +71,7 @@ from clip_benchmark.datasets.builder import build_dataset, get_dataset_collate_f
 from clip_benchmark.metrics import image_caption_selection, zeroshot_classification, zeroshot_retrieval, linear_probe, captioning
 from clip_benchmark.model_collection import get_model_collection_from_file, model_collection
 from clip_benchmark.models import load_clip, MODEL_TYPES
+import open_clip
 
 
 @torch.no_grad()
@@ -150,19 +151,15 @@ def generate_examples(
 
 device = "cuda"
 config = get_config()
-config.model.pretrained = f"logs/{config.experiment.name}/current_pipeline"
-vae = maybe_load_model(config, "vae", default_model_factory=AutoencoderKL).to(
-    device, dtype=torch.float32
-)
-tokenizer = maybe_load_model(
-    config, "tokenizer", default_model_factory=CLIPTokenizer
-)
+#config.model.pretrained = f"logs/{config.experiment.name}/current_pipeline"
+config.model.pretrained = "pretrained/clip_b32_openai_pretrained"
+tokenizer = open_clip.get_tokenizer("ViT-B-32")
 clip = maybe_load_model(
-         config, "clip", default_model_factory=CLIPCustom,
+    config, "clip", default_model_factory=CLIPCustom,
 ).to(device, dtype=torch.float32)
 res = 224
-transform = CenterCropSDTransform(center_crop=True, size=res)
-
+#transform = CenterCropSDTransform(center_crop=True, size=res)
+_, _, transform = open_clip.create_model_and_transforms('ViT-B-32')
 dataset = build_dataset(
     dataset_name="wds/imagenet1k", 
     root="/p/fastdata/mmlaion/vtab_plus_wds/imagenet1k", 
@@ -177,7 +174,6 @@ dataloader = torch.utils.data.DataLoader(
 )
 classnames = dataset.classes
 templates = dataset.templates
-import open_clip
 results = zeroshot_classification.evaluate(
     clip,
     dataloader,

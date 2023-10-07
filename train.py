@@ -68,42 +68,51 @@ import inspect
 from typing import Any, Callable, Dict, List, Optional, Union
 from copy import deepcopy
 
+
 class CLIPCustom(CLIPModel):
 
     def __init__(self, config, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
-        out_dim = config.out_dim if hasattr(config, "out_dim") else None
-        proj1 = config.proj1 if hasattr(config, "proj1") else True
-        proj2 = config.proj2 if hasattr(config, "proj2") else True
-        print(proj1, proj2)
-        self.visual_projection1 = torch.nn.Linear(self.visual_projection.in_features, out_dim if out_dim else self.visual_projection.out_features) if proj1 else torch.nn.Sequential()
-        self.text_projection1 = torch.nn.Linear(self.text_projection.in_features, out_dim if out_dim else self.text_projection.out_features) if proj1 else torch.nn.Sequential()
-
-        self.visual_projection2 = torch.nn.Linear(self.visual_projection.in_features, out_dim if out_dim else self.visual_projection.out_features) if proj2 else torch.nn.Sequential()
-        self.text_projection2 = torch.nn.Linear(self.text_projection.in_features, out_dim if out_dim else self.text_projection.out_features) if proj2 else torch.nn.Sequential()
-
-        self.mean = torch.nn.Parameter(torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1))
-        self.std = torch.nn.Parameter(torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1))
+        hidden_state_proj_dim = config.hidden_state_proj_dim if hasattr(config, "hidden_state_proj_dim") else None
+        hidden_state_proj = config.hidden_state_proj if hasattr(config, "hidden_state_proj") else False
+        self.hidden_state_proj = hidden_state_proj
+        self.hidden_state_proj_dim = hidden_state_proj_dim
+        if hidden_state_proj:
+            self.hidden_state_visual_projection = torch.nn.Linear(self.visual_projection.in_features, hidden_state_proj_dim ) 
+            self.hidden_state_text_projection = torch.nn.Linear(self.text_projection.in_features, hidden_state_proj_dim)
+        mean = (torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1))
+        std = (torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1))
+        self.register_buffer("mean", mean)
+        self.register_buffer("std", std)
 
     def forward(self, image, text):
         image_out = self.vision_model(image)
         text_out = self.text_model(text)
 
-        image_out.pooler_output = self.visual_projection2(image_out.pooler_output)
-        image_out.last_hidden_state = self.visual_projection1(image_out.last_hidden_state)
+        image_out.pooler_output = self.visual_projection(image_out.pooler_output)
+        text_out.pooler_output = self.text_projection(text_out.pooler_output)
 
-        text_out.pooler_output = self.text_projection2(text_out.pooler_output)
-        text_out.last_hidden_state = self.text_projection1(text_out.last_hidden_state)
+        if self.hidden_state_proj:
+            image_out.last_hidden_state = self.hidden_state_visual_projection(image_out.last_hidden_state)
+            text_out.last_hidden_state = self.hidden_state_text_projection(text_out.last_hidden_state)
         return image_out, text_out, self.logit_scale.exp()
     
     def encode_text(self, text):
         text_out = self.text_model(text)
-        return self.text_projection2(text_out.pooler_output)
+        pool = text_out.pooler_output
+        return self.text_projection(pool)
     
     def encode_image(self, image):
         image_out = self.vision_model(image)
-        return self.visual_projection2(image_out.pooler_output)
+        pool = image_out.pooler_output
+        return self.visual_projection(pool)
 
+    def encode_text_hidden_state(self, text, attention_mask=None):
+        text_out = self.text_model(text, attention_mask=attention_mask)
+        if self.hidden_state_proj:
+            return self.hidden_state_text_projection(text_out.last_hidden_state)
+        else:
+            return text_out.last_hidden_state
 
 class StableDiffusionPipelineExt(StableDiffusionPipeline):
     def __init__(
@@ -270,7 +279,7 @@ def main():
         tokenizer_guidance = TokenizerForGuidance(tokenizer, config.system.empty_text_proba)
         print(tokenizer)
     else:
-        tokenizer_guidance
+        tokenizer_guidance = tokenizer
     clip =  maybe_load_model(
          config, "clip", default_model_factory=CLIPCustom,
      ).to(device, dtype=torch.float32)
@@ -294,15 +303,11 @@ def main():
     train_unet = config.system.train_unet
     train_clip = config.system.train_clip
 
-    # not used
-    clip.visual_projection.requires_grad_(False)
-    clip.text_projection.requires_grad_(False)
-
     # not used if not clip loss weight
     if config.system.clip_loss_weight == 0:
         clip.logit_scale.requires_grad_(False)
-        clip.visual_projection2.requires_grad_(False)
-        clip.text_projection2.requires_grad_(False)
+        clip.visual_projection.requires_grad_(False)
+        clip.text_projection.requires_grad_(False)
         clip.vision_model.post_layernorm.requires_grad_(False)
 
     if train_unet:
@@ -368,7 +373,24 @@ def main():
     model_full = torch.nn.ModuleDict(
         model_full
     )
-    optimizer = get_optimizer(model_full, **config.optimizer.params)
+
+    unet_params = list(unet.parameters())
+    clip_params = list(clip.parameters())
+
+    if config.optimizer.get("learning_rate_unet", None) is not None or config.optimizer.get("learning_rate_clip", None) is not None:
+        print(config.optimizer.learning_rate_unet, config.optimizer.learning_rate_clip)
+        optimizer = get_optimizer(
+            [
+                {"params": unet_params, "lr": config.optimizer.learning_rate_unet}, 
+                {"params": clip_params, "lr": config.optimizer.learning_rate_clip},
+            ],
+            **config.optimizer.params
+        )
+    else:
+        optimizer = get_optimizer(
+            model_full.parameters(), 
+            **config.optimizer.params
+        )
 
     if optimizer_state_dict:
         optimizer.load_state_dict(optimizer_state_dict)
@@ -461,7 +483,7 @@ def main():
                 x = (x+1)/2
                 x = (x - clip_mean) / clip_std 
             image_out, text_out, logit_scale = clip(x, batch["input_ids"].to(device))
-            if train_unet:
+            if config.system.text_to_image_loss_weight > 0 or config.system.image_to_image_loss_weight > 0:
                 with torch.no_grad():
                     # Ground-truth image latent, no noise
                     #image_emb, image_encoder_hidden_states = encode_image(encoder, batch["pixel_values"].to(device))
@@ -495,7 +517,7 @@ def main():
                         raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
 
-            if train_unet and config.system.text_to_image_loss_weight > 0:
+            if config.system.text_to_image_loss_weight > 0:
                 if config.system.use_pooled_for_conditioning:
                     text_embs = (text_out.pooler_output)
                     text_embs = text_embs.view(text_embs.shape[0], 1, text_embs.shape[1])
@@ -635,11 +657,7 @@ class TextEncoderWrapper:
         self.dtype = self.clip.dtype
     
     def __call__(self, x, attention_mask=None):
-        if self.config.system.use_pooled_for_conditioning:
-            x =  self.clip.text_projection1(self.clip.text_model(x, attention_mask=attention_mask).pooler_output)
-            x = x.view(x.shape[0], 1, x.shape[1])
-        else:
-            x =  self.clip.text_projection1(self.clip.text_model(x, attention_mask=attention_mask).last_hidden_state)
+        x =  self.clip.encode_text_hidden_state(x, attention_mask=attention_mask)
         x = x.view(1, x.shape[0], x.shape[1], x.shape[2])
         return x
 
