@@ -1,4 +1,4 @@
-# use pre-trained clip b32 with new projections, use pre-trained unet, and fine-tune everything on datacomp
+# use from scratch clip b32, use pre-trained unet (freeze)
 wandb:
     api_key: null
     entity: null
@@ -9,14 +9,13 @@ system:
     batch_size: 64
     workers: 4
     use_pooled_for_conditioning: False
-    image_to_image_loss_weight: 0
+    image_to_image_loss_weight: 1
     text_to_image_loss_weight: 1
     train_unet: True
     train_clip: True
-    clip_loss_weight: 0
+    clip_loss_weight: 1
     dist_backend: ${distributed.dist_backend}
     dist_url: ${distributed.dist_url}
-    empty_text_proba: 0.2
 
 distributed:
     dist_backend: 'nccl'
@@ -26,7 +25,7 @@ experiment:
     log_dir: ./logs
     name: "exp1"
     project: "stable-diffusion-clip"
-    num_examples_to_see: 1280000000
+    num_examples_to_see: 128000000
     save_every: 5000
     requeue: True
     eval_caption_file: data/prompts/uid_caption.csv
@@ -34,8 +33,10 @@ experiment:
 
 optimizer:
     name: adamw
+    learning_rate_unet: 0.0000
+    learning_rate_clip: 0.0005
     params:
-        learning_rate: 0.0001
+        learning_rate: null
         beta1: 0.9
         beta2: 0.98 # changed from initial sd value for training stability
         weight_decay: 0.01
@@ -46,7 +47,7 @@ model:
     vae:
         pretrained: ${model.pt_path}
     clip:
-        pretrained: pretrained/clip_b32_openai_pretrained
+        pretrained: pretrained/openclip_b32_laion_scratch
     tokenizer:
         pretrained: ${model.pt_path}
     noise_scheduler_training:
@@ -67,6 +68,8 @@ dataset:
     type: WebDataset
     params: 
         path: /p/scratch/ccstdl/cherti1/datacomp_1B/{0000000..0139827}.tar
+        #path: /p/scratch/ccstdl/cherti1/pokemon-blip-captions/data/data.tar
+        #path: /p/fastdata/mmlaion/laion2B-en/{00000..23295}.tar
         batch_size: ${system.batch_size}
         workers: ${system.workers}
         num_examples_to_see: ${experiment.num_examples_to_see}
@@ -75,5 +78,5 @@ dataset:
 lr_scheduler:
     scheduler: "ConstantWithWarmup"
     params:
-        learning_rate: ${optimizer.params.learning_rate}
+        learning_rate: 0.0005
         warmup_length: 500    
