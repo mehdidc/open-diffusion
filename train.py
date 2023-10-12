@@ -1,6 +1,7 @@
 from utils.logging import dict_from_flatten, flatten_omega_conf
 from utils.net_utils import grad_norm_sum, maybe_load_model
 from PIL import Image
+from torch.utils.tensorboard import SummaryWriter
 
 import sys, os
 import argparse
@@ -21,6 +22,7 @@ import numpy as np
 import torch.utils.checkpoint
 import random as r
 import data
+import tensorboard
 import wandb
 
 from omegaconf import OmegaConf
@@ -224,15 +226,16 @@ def main():
         )
 
         wandb.run.log_code(".")
-
+        tb_writer = SummaryWriter(os.path.join(config.experiment.log_dir, config.experiment.name, "tensorboard"))
     log_if_global_master("Setting mixed precision")
 
     if config.model.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
-
-    elif config.model.mixed_precision is not None:
-        logging.error("=> Non-bfloat16 mixed precision not supported")
-        raise ValueError()
+    else:
+        weight_dtype = torch.float16
+    # elif config.model.mixed_precision is not None:
+        # logging.error("=> Non-bfloat16 mixed precision not supported")
+        # raise ValueError()
 
     #########################
     # PREPARING MODELS      #
@@ -310,6 +313,10 @@ def main():
         clip.text_projection.requires_grad_(False)
         clip.vision_model.post_layernorm.requires_grad_(False)
 
+    if not train_unet:
+        clip.hidden_state_text_projection.requires_grad_(False)
+        clip.hidden_state_visual_projection.requires_grad_(False)
+
     if train_unet:
         unet = DistributedDataParallel(unet, device_ids=[device])
     else:
@@ -377,20 +384,20 @@ def main():
     unet_params = list(unet.parameters())
     clip_params = list(clip.parameters())
 
-    if config.optimizer.get("learning_rate_unet", None) is not None or config.optimizer.get("learning_rate_clip", None) is not None:
-        print(config.optimizer.learning_rate_unet, config.optimizer.learning_rate_clip)
-        optimizer = get_optimizer(
-            [
-                {"params": unet_params, "lr": config.optimizer.learning_rate_unet}, 
-                {"params": clip_params, "lr": config.optimizer.learning_rate_clip},
-            ],
-            **config.optimizer.params
-        )
-    else:
-        optimizer = get_optimizer(
-            model_full.parameters(), 
-            **config.optimizer.params
-        )
+
+    if config.optimizer.get("learning_rate"):
+        config.optimizer.learning_rate_unet = config.optimizer.learning_rate
+        config.optimizer.learning_rate_clip = config.optimizer.learning_rate
+    if config.optimizer.get("weight_decay"):
+        config.optimizer.weight_decay_unet = config.optimizer.weight_decay
+        config.optimizer.weight_decay_clip = config.optimizer.weight_decay
+    optimizer = get_optimizer(
+        [
+            {"params": unet_params, "lr": config.optimizer.learning_rate_unet, "weight_decay": config.optimizer.weight_decay_unet}, 
+            {"params": clip_params, "lr": config.optimizer.learning_rate_clip, "weight_decay": config.optimizer.weight_decay_clip},
+        ],
+        **config.optimizer.params
+    )
 
     if optimizer_state_dict:
         optimizer.load_state_dict(optimizer_state_dict)
@@ -399,6 +406,11 @@ def main():
         # PyTorch deepcopies the optimizer state_dict so it doubles the model param cost
         optimizer_state_dict = None
 
+    if config.lr_scheduler.params.get("learning_rate") is None:
+        config.lr_scheduler.params.learning_rate= [
+            config.optimizer.learning_rate_unet,
+            config.optimizer.learning_rate_clip,
+        ]
     lr_scheduler = getattr(schedulers, config.lr_scheduler.scheduler)(
         optimizer=optimizer,
         total_steps=config.experiment.num_examples_to_see // effective_batch_size,
@@ -529,7 +541,7 @@ def main():
                 text_to_image_loss = F.mse_loss(noise_pred, target, reduction="mean")
             else:
                 text_to_image_loss = torch.tensor(0.0)
-            if train_unet and config.system.image_to_image_loss_weight > 0:
+            if config.system.image_to_image_loss_weight > 0:
                 # p = encoder.proj_image(image_encoder_hidden_states)
                 if config.system.use_pooled_for_conditioning:
                     image_embs = (image_out.pooler_output)
@@ -602,6 +614,16 @@ def main():
                 },
                 step=step,
             )
+            tb_writer.add_scalar("step_loss", loss.detach().item(), step)
+            tb_writer.add_scalar("image_to_image_loss", image_to_image_loss.detach().item(), step)
+            tb_writer.add_scalar("text_to_image_loss", text_to_image_loss.detach().item(), step)
+            tb_writer.add_scalar("clip_loss", clip_loss_value.detach().item(), step)
+            tb_writer.add_scalar("logit_scale", logit_scale_scalar, step)
+            tb_writer.add_scalar("lr", lr_scheduler.current_lr(), step)
+            tb_writer.add_scalar("iter", step, step)
+            tb_writer.add_scalar("images/sec", images_per_second_per_gpu * config.system.world_size, step)
+            tb_writer.add_scalar("images/sec/gpu", images_per_second_per_gpu, step)
+        
             logging.info(
                 f"[{num_examples_seen}/{config.experiment.num_examples_to_see}] "
                 f"({100*num_examples_seen/config.experiment.num_examples_to_see:0.2f}%): "
