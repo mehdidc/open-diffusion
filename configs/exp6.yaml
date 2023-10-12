@@ -1,5 +1,4 @@
-# use from scratch clip b32, use pre-trained unet, train both
-# => generative losses go up after warmup, clip loss is fine
+# like exp4, but unet from scratch rather than pre-trained
 wandb:
     api_key: null
     entity: null
@@ -14,7 +13,7 @@ system:
     text_to_image_loss_weight: 1
     train_unet: True
     train_clip: True
-    clip_loss_weight: 1
+    clip_loss_weight: 0.1
     dist_backend: ${distributed.dist_backend}
     dist_url: ${distributed.dist_url}
 
@@ -24,7 +23,7 @@ distributed:
 
 experiment:
     log_dir: ./logs
-    name: "exp1"
+    name: "exp6"
     project: "stable-diffusion-clip"
     num_examples_to_see: 128000000
     save_every: 5000
@@ -34,8 +33,8 @@ experiment:
 
 optimizer:
     name: adamw
-    learning_rate_unet: 0.0005
-    learning_rate_clip: 0.0005
+    learning_rate_unet: 0.0001
+    learning_rate_clip: 0.0001
     params:
         learning_rate: null
         beta1: 0.9
@@ -59,7 +58,29 @@ model:
         target: DDIMScheduler
     unet:
         target: UNet2DConditionModel
-        pretrained: ${model.pt_path}
+        params:
+            act_fn: "silu"
+            attention_head_dim: 8
+            block_out_channels: [320, 640, 1280, 1280]
+            center_input_sample: False
+            cross_attention_dim: 1024
+            down_block_types: ["CrossAttnDownBlock2D","CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "DownBlock2D"]
+            downsample_padding: 1
+            flip_sin_to_cos: true
+            freq_shift: 0
+            in_channels: 4
+            layers_per_block: 2
+            mid_block_scale_factor: 1
+            norm_eps: 1e-05
+            norm_num_groups: 32
+            out_channels: 4
+            sample_size: 32
+            up_block_types: [
+                "UpBlock2D",
+                "CrossAttnUpBlock2D",
+                "CrossAttnUpBlock2D",
+                "CrossAttnUpBlock2D"
+            ]
     use_ema: True 
     mixed_precision: bf16
     gradient_checkpointing: True
@@ -79,5 +100,5 @@ dataset:
 lr_scheduler:
     scheduler: "ConstantWithWarmup"
     params:
-        learning_rate: 0.0005
+        learning_rate: 0.0001
         warmup_length: 500    

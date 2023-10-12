@@ -1,5 +1,6 @@
-# use from scratch clip b32, use pre-trained unet, train both
-# => generative losses go up after warmup, clip loss is fine
+# like exp11, bt with clip loss weight of 1
+# => best results so far 0.36 imagenet
+# images per sec per gpu: 48.82, for 64 gpus
 wandb:
     api_key: null
     entity: null
@@ -24,7 +25,7 @@ distributed:
 
 experiment:
     log_dir: ./logs
-    name: "exp1"
+    name: "exp12"
     project: "stable-diffusion-clip"
     num_examples_to_see: 128000000
     save_every: 5000
@@ -34,13 +35,15 @@ experiment:
 
 optimizer:
     name: adamw
-    learning_rate_unet: 0.0005
+    learning_rate_unet: 0.0000
     learning_rate_clip: 0.0005
+    weight_decay_unet: 0.0000
+    weight_decay_clip: 0.01
     params:
         learning_rate: null
         beta1: 0.9
         beta2: 0.98 # changed from initizal sd value for training stability
-        weight_decay: 0.01
+        weight_decay: null
         epsilon: 0.00000001
 
 model:
@@ -79,5 +82,5 @@ dataset:
 lr_scheduler:
     scheduler: "ConstantWithWarmup"
     params:
-        learning_rate: 0.0005
+        learning_rate: null
         warmup_length: 500    

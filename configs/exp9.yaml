@@ -1,5 +1,4 @@
-# use from scratch clip b32, use pre-trained unet, train both
-# => generative losses go up after warmup, clip loss is fine
+# like exp8, but increase clip weight to 0.5 to improve perf?
 wandb:
     api_key: null
     entity: null
@@ -14,7 +13,7 @@ system:
     text_to_image_loss_weight: 1
     train_unet: True
     train_clip: True
-    clip_loss_weight: 1
+    clip_loss_weight: 0.5
     dist_backend: ${distributed.dist_backend}
     dist_url: ${distributed.dist_url}
 
@@ -24,7 +23,7 @@ distributed:
 
 experiment:
     log_dir: ./logs
-    name: "exp1"
+    name: "exp9"
     project: "stable-diffusion-clip"
     num_examples_to_see: 128000000
     save_every: 5000
@@ -34,8 +33,10 @@ experiment:
 
 optimizer:
     name: adamw
-    learning_rate_unet: 0.0005
+    learning_rate_unet: 0.0000
     learning_rate_clip: 0.0005
+    weight_decay_unet: 0.0000
+    weight_decay_clip: 0.01
     params:
         learning_rate: null
         beta1: 0.9

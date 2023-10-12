@@ -1,5 +1,5 @@
-# use from scratch clip b32, use pre-trained unet, train both
-# => generative losses go up after warmup, clip loss is fine
+# use from scratch clip b32 (train), use pre-trained unet (train)
+# so like exp1, except with different clip loss weight and LR
 wandb:
     api_key: null
     entity: null
@@ -14,7 +14,7 @@ system:
     text_to_image_loss_weight: 1
     train_unet: True
     train_clip: True
-    clip_loss_weight: 1
+    clip_loss_weight: 0.1
     dist_backend: ${distributed.dist_backend}
     dist_url: ${distributed.dist_url}
 
@@ -24,7 +24,7 @@ distributed:
 
 experiment:
     log_dir: ./logs
-    name: "exp1"
+    name: "exp4"
     project: "stable-diffusion-clip"
     num_examples_to_see: 128000000
     save_every: 5000
@@ -34,8 +34,8 @@ experiment:
 
 optimizer:
     name: adamw
-    learning_rate_unet: 0.0005
-    learning_rate_clip: 0.0005
+    learning_rate_unet: 0.0001
+    learning_rate_clip: 0.0001
     params:
         learning_rate: null
         beta1: 0.9
@@ -79,5 +79,5 @@ dataset:
 lr_scheduler:
     scheduler: "ConstantWithWarmup"
     params:
-        learning_rate: 0.0005
+        learning_rate: 0.0001
         warmup_length: 500    

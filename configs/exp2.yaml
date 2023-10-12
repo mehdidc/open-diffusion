@@ -1,5 +1,4 @@
-# use from scratch clip b32, use pre-trained unet, train both
-# => generative losses go up after warmup, clip loss is fine
+# use from scratch clip b32, use pre-trained unet (freeze), give only 0.1 weight to clip loss
 wandb:
     api_key: null
     entity: null
@@ -14,7 +13,7 @@ system:
     text_to_image_loss_weight: 1
     train_unet: True
     train_clip: True
-    clip_loss_weight: 1
+    clip_loss_weight: 0.1
     dist_backend: ${distributed.dist_backend}
     dist_url: ${distributed.dist_url}
 
@@ -24,7 +23,7 @@ distributed:
 
 experiment:
     log_dir: ./logs
-    name: "exp1"
+    name: "exp2"
     project: "stable-diffusion-clip"
     num_examples_to_see: 128000000
     save_every: 5000
