@@ -131,13 +131,6 @@ def generate_examples(
                 width=resolution,
                 num_inference_steps=50,
             )
-        images.extend(
-            [
-                torchvision.transforms.ToTensor()(image).unsqueeze(0)
-                for image in out.images
-            ]
-        )
-
         for filename, image in zip(filenames, out.images):
             image.save(Path(out_dir) / f"{filename}.jpg")
 
@@ -151,17 +144,18 @@ vae = maybe_load_model(config, "vae", default_model_factory=AutoencoderKL).to(
 tokenizer = maybe_load_model(
     config, "tokenizer", default_model_factory=CLIPTokenizer
 )
+
 clip = maybe_load_model(
     config, "clip", default_model_factory=CLIPCustom,
 ).to(device, dtype=torch.float32)
 unet = maybe_load_model(
     config, "unet", default_model_factory=UNet2DConditionModel
 ).to(device, dtype=torch.float32)
-scheduler = maybe_load_model(config, "noise_scheduler_inference", subfolder="scheduler", default_model_factory=PNDMScheduler)
+scheduler = maybe_load_model(config, "noise_scheduler_inference", subfolder="scheduler", default_model_factory=DDIMScheduler)
 print(scheduler)
 captions = [
-    "a chair in the form of an avocado",
-] * 8
+    "picture of a red chair next to a blue car",
+] * 32
 nb = len(captions)
 out = "out"
 res = 224
