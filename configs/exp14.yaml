@@ -1,0 +1,106 @@
+# clip and unet from scratch
+wandb:
+    api_key: null
+    entity: null
+    mode: offline
+
+system:
+    gradient_accumulation: 1
+    batch_size: 64
+    workers: 4
+    use_pooled_for_conditioning: False
+    image_to_image_loss_weight: 1
+    text_to_image_loss_weight: 1
+    train_unet: True
+    train_clip: True
+    clip_loss_weight: 1
+    dist_backend: ${distributed.dist_backend}
+    dist_url: ${distributed.dist_url}
+
+distributed:
+    dist_backend: 'nccl'
+    dist_url: 'env://'
+
+experiment:
+    log_dir: ./logs
+    name: "exp14"
+    project: "stable-diffusion-clip"
+    num_examples_to_see: 128000000
+    save_every: 5000
+    requeue: True
+    eval_caption_file: data/prompts/uid_caption.csv
+    num_eval_images: 200
+
+optimizer:
+    name: adamw
+    learning_rate_unet: 0.0001
+    learning_rate_clip: 0.0005
+    weight_decay_unet: 0.0000
+    weight_decay_clip: 0.01
+    params:
+        learning_rate: null
+        beta1: 0.9
+        beta2: 0.98 # changed from initizal sd value for training stability
+        weight_decay: null
+        epsilon: 0.00000001
+
+model:
+    pt_path: pretrained/stable-diffusion-2-1
+    vae:
+        pretrained: ${model.pt_path}
+    clip:
+        pretrained: pretrained/openclip_b32_laion_scratch
+    tokenizer:
+        pretrained: ${model.pt_path}
+    noise_scheduler_training:
+        pretrained: ${model.pt_path}
+        target: DDPMNoiseScheduler
+    noise_scheduler_inference:
+        pretrained: ${model.pt_path}
+        target: DDIMScheduler
+    unet:
+        target: UNet2DConditionModel
+        params:
+            act_fn: "silu"
+            attention_head_dim: 8
+            block_out_channels: [320, 640, 1280, 1280]
+            center_input_sample: False
+            cross_attention_dim: 1024
+            down_block_types: ["CrossAttnDownBlock2D","CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "DownBlock2D"]
+            downsample_padding: 1
+            flip_sin_to_cos: true
+            freq_shift: 0
+            in_channels: 4
+            layers_per_block: 2
+            mid_block_scale_factor: 1
+            norm_eps: 1e-05
+            norm_num_groups: 32
+            out_channels: 4
+            sample_size: 32
+            up_block_types: [
+                "UpBlock2D",
+                "CrossAttnUpBlock2D",
+                "CrossAttnUpBlock2D",
+                "CrossAttnUpBlock2D"
+            ]
+    use_ema: True 
+    mixed_precision: bf16
+    gradient_checkpointing: True
+    xformers: True
+
+dataset:
+    type: WebDataset
+    params: 
+        path: /p/scratch/ccstdl/cherti1/datacomp_1B/{0000000..0139827}.tar
+        #path: /p/scratch/ccstdl/cherti1/pokemon-blip-captions/data/data.tar
+        #path: /p/fastdata/mmlaion/laion2B-en/{00000..23295}.tar
+        batch_size: ${system.batch_size}
+        workers: ${system.workers}
+        num_examples_to_see: ${experiment.num_examples_to_see}
+        resolution: 224
+
+lr_scheduler:
+    scheduler: "ConstantWithWarmup"
+    params:
+        learning_rate: null
+        warmup_length: 500    
