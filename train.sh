@@ -1,0 +1,1 @@
+EXP=$1;mkdir logs/$EXP/;python /p/project/ccstdl/laion/helpers/autorestart.py "sbatch -t 360 -N 16 --partition dc-gpu run.sbatch configs/$EXP.yaml" --output-file-template=logs/$EXP/logs.txt --termination-str="Logging final model" 
