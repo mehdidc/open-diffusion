@@ -35,6 +35,7 @@ class CosineWithWarmup(Scheduler):
             self.base_lrs = [self.base_lrs for _ in optimizer.param_groups]
 
         assert len(self.base_lrs) == len(optimizer.param_groups)
+        print(self.base_lrs)
 
     def step(self, iteration):
         for param_group, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
@@ -50,6 +51,7 @@ class CosineWithWarmup(Scheduler):
         return lr
 
 
+from omegaconf import ListConfig
 class ConstantWithWarmup(Scheduler):
     def __init__(self, optimizer, learning_rate, total_steps, warmup_length=0) -> None:
         super().__init__()
@@ -58,8 +60,8 @@ class ConstantWithWarmup(Scheduler):
         self.base_lrs = learning_rate
         self.warmup_length = warmup_length
         self.total_steps = total_steps
-
-        if not isinstance(self.base_lrs, list):
+        
+        if not isinstance(self.base_lrs, list) and not isinstance(self.base_lrs, ListConfig):
             self.base_lrs = [self.base_lrs for _ in optimizer.param_groups]
 
         assert len(self.base_lrs) == len(optimizer.param_groups)

@@ -12,7 +12,6 @@ def get_optimizer(
         return torch.optim.AdamW(
         model,
         betas=(beta1, beta2),
-        weight_decay=weight_decay,
         eps=epsilon,
     )
     else:     
