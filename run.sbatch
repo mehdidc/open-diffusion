@@ -20,4 +20,5 @@ export PYTHONPATH="$PYTHONPATH:$PWD/src"
 #export CUDA_LAUNCH_BLOCKING=1
 export TRANSFORMERS_CACHE=cache
 export TRANSFORMERS_OFFLINE=1
+export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
 srun --cpu_bind=none,v --accel-bind=gn python -u train.py config=$1
