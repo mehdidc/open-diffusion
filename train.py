@@ -481,6 +481,7 @@ def main():
     clip.train()
     clip_mean = clip.module.mean if hasattr(clip, "module") else clip.mean
     clip_std = clip.module.std if hasattr(clip, "module") else clip.std
+
     for batch in train_dataset.loader:
   
         lr = lr_scheduler.step(step // config.system.get("gradient_accumulation", 1))
