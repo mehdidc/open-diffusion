@@ -41,6 +41,7 @@ from diffusers import (
     DDPMScheduler,
     PNDMScheduler,
     StableDiffusionPipeline,
+    DDIMScheduler,
 )
 
 from diffusers.optimization import get_scheduler
@@ -68,11 +69,13 @@ from train import CLIPCustom, TextEncoderWrapper
 from data.policies import CenterCropSDTransform
 
 from clip_benchmark.datasets.builder import build_dataset, get_dataset_collate_fn, get_dataset_default_task, dataset_collection, get_dataset_collection_from_file
-from clip_benchmark.metrics import image_caption_selection, zeroshot_classification, zeroshot_retrieval, linear_probe, captioning
+from clip_benchmark.metrics import image_caption_selection, zeroshot_classification, zeroshot_retrieval, linear_probe, captioning, image_caption_selection
 from clip_benchmark.model_collection import get_model_collection_from_file, model_collection
 from clip_benchmark.models import load_clip, MODEL_TYPES
 import open_clip
+import webdataset as wds 
 
+import generative_classifier
 
 @torch.no_grad()
 def generate_examples(
@@ -151,8 +154,12 @@ def generate_examples(
 
 device = "cuda"
 config = get_config()
-#config.model.pretrained = f"logs/{config.experiment.name}/current_pipeline"
-config.model.pretrained = "pretrained/clip_b32_openai_pretrained"
+step = config.get("step","current_pipeline")
+step_orig = step
+if step != "current_pipeline" and step != "final":
+    step = os.path.join("pipelines", step)
+config.model.pretrained = f"logs/{config.experiment.name}/{step}"
+#config.model.pretrained = "pretrained/clip_b32_openai_pretrained"
 tokenizer = open_clip.get_tokenizer("ViT-B-32")
 clip = maybe_load_model(
     config, "clip", default_model_factory=CLIPCustom,
@@ -160,25 +167,73 @@ clip = maybe_load_model(
 res = 224
 #transform = CenterCropSDTransform(center_crop=True, size=res)
 _, _, transform = open_clip.create_model_and_transforms('ViT-B-32')
+dataset_name = config.get("dataset", "imagenet1k")
+dataset_root = config.get("dataset_root")
+task = config.get("task", "zeroshot_image_classification")
 dataset = build_dataset(
-    dataset_name="wds/imagenet1k", 
-    root="/p/fastdata/mmlaion/vtab_plus_wds/imagenet1k", 
+    dataset_name=dataset_name, 
+    root=dataset_root, 
     transform=transform, 
     split="test", 
     download=True,
 )
-batch_size = 64
-dataloader = torch.utils.data.DataLoader(
-    dataset.batched(batch_size), batch_size=None, 
-    shuffle=False, num_workers=4,
-)
-classnames = dataset.classes
-templates = dataset.templates
-results = zeroshot_classification.evaluate(
-    clip,
-    dataloader,
-    open_clip.tokenizer.tokenize,
-    classnames, templates, 
-    device,
-)
+batch_size = config.get("batch_size", 64)
+if type(dataset) == wds.WebDataset:
+    dataloader = torch.utils.data.DataLoader(
+        dataset.batched(batch_size), batch_size=None, 
+        shuffle=False, num_workers=4,
+    )
+else:
+    dataloader = torch.utils.data.DataLoader(
+        dataset, batch_size=batch_size, 
+        shuffle=False, num_workers=4,
+    )
+if task == "zeroshot_classification":
+    classnames = dataset.classes
+    templates = dataset.templates
+    results = zeroshot_classification.evaluate(
+        clip,
+        dataloader,
+        open_clip.tokenizer.tokenize,
+        classnames, templates, 
+        device,
+    )
+elif task == "generative_zeroshot_classification":
+    classnames = dataset.classes
+    templates = dataset.templates[0:1]
+    vae = maybe_load_model(config, "vae", default_model_factory=AutoencoderKL).to(
+        device, dtype=torch.float32
+    )
+    tokenizer = maybe_load_model(
+        config, "tokenizer", default_model_factory=CLIPTokenizer
+    )
+    unet = maybe_load_model(
+        config, "unet", default_model_factory=UNet2DConditionModel
+    ).to(device, dtype=torch.float32)
+    noise_scheduler = maybe_load_model(config, "noise_scheduler_inference", subfolder="scheduler", default_model_factory=DDIMScheduler)
+
+    class model:
+        vae = vae
+        clip = clip
+        unet = unet
+        noise_scheduler = noise_scheduler
+        tokenizer = open_clip.tokenizer
+
+    results = generative_classifier.evaluate(
+        model,
+        dataloader,
+        open_clip.tokenizer.tokenize,
+        classnames, templates, 
+        device,
+    )
+elif task == "sugar_crepe":
+    results = image_caption_selection.evaluate(
+        clip,
+        dataloader,
+        open_clip.tokenizer.tokenize,
+        device,
+    )
 print(results)
+slug = dataset_name.replace("/", "_")
+with open(os.path.join("logs", config.experiment.name, f"{slug}_{task}_{step_orig}.json"), "w") as f:
+    json.dump(results, f, indent=4)
