@@ -65,32 +65,28 @@ import shutil
 import pandas as pd
 import time
 
-from train import CLIPCustom, TextEncoderWrapper
+from train import CLIPCustom, TextEncoderWrapper, ImageEncoderWrapper
 from data.policies import CenterCropSDTransform
 @torch.no_grad()
 def generate_examples(
+    raw,
     config,
-    text_encoder,
+    clip,
     vae,
     unet,
     tokenizer,
     scheduler,
     out_dir,
-    caption_file,
     num_examples=1000,
     resolution=512,
     device="cpu",
     bs=10,
-):
-    # Make sure num_examples to generate is divisible by world_size
-    if type(caption_file) == list:
-        D = caption_file
-    else:
-        D = [caption_file] * num_examples
-    text_db = pd.DataFrame({"uid": np.arange(len(D)), "caption": D})
+    guidance_scale=7.5,
+    steps=50,
+):   
     pipeline = StableDiffusionPipeline(
         vae=vae,
-        text_encoder=text_encoder,
+        text_encoder=clip,
         unet=unet,
         tokenizer=tokenizer,
         safety_checker=None,
@@ -101,50 +97,40 @@ def generate_examples(
 
     pipeline.set_progress_bar_config(disable=True)
     pipeline.safety_checker = None  # disable safety checker (testing only)
-    #pipeline.enable_vae_slicing()
 
-    examples = list(zip(text_db.uid.to_list(), text_db.caption.to_list()))
-    example_shards = list(
-        batchify(
-            examples,
-            batch_size=max(num_examples, len(text_db)),
+    rng = torch.Generator()
+    rng.manual_seed(0)
+
+    if type(raw) == list:
+        text_tokens= tokenizer(raw, return_tensors="pt", padding=True).input_ids.to(device)
+        embs = clip.encode_text_hidden_state(text_tokens)
+    else:
+        embs= clip.encode_image_hidden_state(raw)
+    neg_tokens = tokenizer([""], return_tensors="pt", padding="max_length", max_length=embs.shape[1]).input_ids.to(device).repeat(len(embs),1)
+    neg_embs = clip.encode_text_hidden_state(neg_tokens)
+    with torch.autocast(device_type="cuda"):
+        out = pipeline(
+            guidance_scale=guidance_scale,
+            generator=rng,
+            height=resolution,
+            width=resolution,
+            num_inference_steps=steps,
+            prompt_embeds=embs,
+            negative_prompt_embeds=neg_embs,
         )
-    )
-
-    #print(example_shards)
-    images = []
-    I = 0
-    for batch in batchify(
-        example_shards[0], batch_size=bs
-    ):
-        filenames, text_raw = zip(*batch)
-        print(len(text_raw))
-        rng = torch.Generator()
-        rng.manual_seed(I)
-        I += 1
-        with torch.autocast(device_type="cuda"):
-            out = pipeline(
-                list(text_raw),
-                guidance_scale=7.5,
-                generator=rng,
-                height=resolution,
-                width=resolution,
-                num_inference_steps=50,
-            )
-        for filename, image in zip(filenames, out.images):
-            image.save(Path(out_dir) / f"{filename}.jpg")
+    filenames = [f"{i:05d}" for i in range(len(out.images))]
+    for filename, image in zip(filenames, out.images):
+        image.save(Path(out_dir) / f"{filename}.jpg")
 
 device = "cuda"
 config = get_config()
 config.model.pretrained = f"logs/{config.experiment.name}/current_pipeline"
-#config.model.pretrained = "pretrained/stable-diffusion-2-1"
 vae = maybe_load_model(config, "vae", default_model_factory=AutoencoderKL).to(
     device, dtype=torch.float32
 )
 tokenizer = maybe_load_model(
     config, "tokenizer", default_model_factory=CLIPTokenizer
 )
-
 clip = maybe_load_model(
     config, "clip", default_model_factory=CLIPCustom,
 ).to(device, dtype=torch.float32)
@@ -153,23 +139,35 @@ unet = maybe_load_model(
 ).to(device, dtype=torch.float32)
 scheduler = maybe_load_model(config, "noise_scheduler_inference", subfolder="scheduler", default_model_factory=DDIMScheduler)
 print(scheduler)
-captions = [
-    "picture of a red chair next to a blue car",
-] * 32
-nb = len(captions)
-out = "out"
-res = 224
-text_encoder = TextEncoderWrapper(config, clip)
+
+nb = config.get("nb", 8)
+res = config.get("res", 224)
+
+if config.get("url"):
+    import requests
+    url= config.get("url")
+    input = Image.open(
+        requests.get(
+            url, stream=True
+    ).raw).convert("RGB").resize((res, res))
+    input = torchvision.transforms.ToTensor()(input).unsqueeze(0).to(device)
+    inputs = (input - clip.mean) / clip.std
+    inputs = inputs.repeat(nb,1,1,1)
+else:
+    caption = config.get("caption", "a picture of a red chair next to a blue car")
+    inputs = [caption] * nb
+out = config.get("out", "out")
 generate_examples(
+    inputs,
     config,
-    text_encoder,
+    clip,
     vae,
     unet,
     tokenizer,
     scheduler,
     out,
-    captions,
     num_examples=nb,
     resolution=res,
     device=device,
+    guidance_scale=config.get("guidance_scale", 7.5),
 )
