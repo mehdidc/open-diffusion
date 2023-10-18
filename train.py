@@ -71,6 +71,28 @@ from typing import Any, Callable, Dict, List, Optional, Union
 from copy import deepcopy
 
 
+
+def random_masking(x, mask_ratio):
+    """
+    Perform per-sample random masking by per-sample shuffling.
+    Per-sample shuffling is done by argsort random noise.
+    x: [N, L, D], sequence
+    """
+    N, L, D = x.shape  # batch, length, dim
+    len_keep = int(L * (1 - mask_ratio))
+    
+    noise = torch.rand(N, L, device=x.device)  # noise in [0, 1]
+    
+    # sort noise for each sample
+    ids_shuffle = torch.argsort(noise, dim=1)  # ascend: small is keep, large is remove
+    ids_restore = torch.argsort(ids_shuffle, dim=1)
+
+    # keep the first subset
+    ids_keep = ids_shuffle[:, :len_keep]
+    x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+
+    return x_masked
+
 class CLIPCustom(CLIPModel):
 
     def __init__(self, config, *args, **kwargs):
@@ -116,6 +138,13 @@ class CLIPCustom(CLIPModel):
         else:
             return text_out.last_hidden_state
 
+    def encode_image_hidden_state(self, image):
+        image_out = self.vision_model(image)
+        if self.hidden_state_proj:
+            return self.hidden_state_visual_projection(image_out.last_hidden_state)
+        else:
+            return image_out.last_hidden_state
+
 class StableDiffusionPipelineExt(StableDiffusionPipeline):
     def __init__(
         self,
@@ -133,6 +162,7 @@ class StableDiffusionPipelineExt(StableDiffusionPipeline):
         self.register_modules(
             clip=clip,
         )
+
 
 
 def set_seed(seed):
@@ -496,10 +526,8 @@ def main():
                 x = (x+1)/2
                 x = (x - clip_mean) / clip_std 
             image_out, text_out, logit_scale = clip(x, batch["input_ids"].to(device))
-            if config.system.text_to_image_loss_weight > 0 or config.system.image_to_image_loss_weight > 0:
+            if config.system.text_to_image_loss_weight > 0 or config.system.image_to_image_loss_weight > 0 or config.system.mix_loss_weight > 0:
                 with torch.no_grad():
-                    # Ground-truth image latent, no noise
-                    #image_emb, image_encoder_hidden_states = encode_image(encoder, batch["pixel_values"].to(device))
                     latents = vae.encode(
                         batch["pixel_values"].to(device)
                     ).latent_dist.sample()
@@ -531,11 +559,7 @@ def main():
 
 
             if config.system.text_to_image_loss_weight > 0:
-                if config.system.use_pooled_for_conditioning:
-                    text_embs = (text_out.pooler_output)
-                    text_embs = text_embs.view(text_embs.shape[0], 1, text_embs.shape[1])
-                else:
-                    text_embs = (text_out.last_hidden_state)
+                text_embs = (text_out.last_hidden_state)
                 (noise_pred,) = unet(
                     noisy_latents, timesteps, text_embs, return_dict=False
                 )
@@ -543,12 +567,7 @@ def main():
             else:
                 text_to_image_loss = torch.tensor(0.0)
             if config.system.image_to_image_loss_weight > 0:
-                # p = encoder.proj_image(image_encoder_hidden_states)
-                if config.system.use_pooled_for_conditioning:
-                    image_embs = (image_out.pooler_output)
-                    image_embs = image_embs.view(image_embs.shape[0], 1, image_embs.shape[1])
-                else:
-                    image_embs = (image_out.last_hidden_state)
+                image_embs = (image_out.last_hidden_state)
                 (noise_pred,) = unet(
                     noisy_latents, timesteps, image_embs, return_dict=False
                 )
@@ -556,7 +575,19 @@ def main():
                 image_to_image_loss = F.mse_loss(noise_pred, target, reduction="mean")
             else:
                 image_to_image_loss = torch.tensor(0.0)
-            
+
+            if config.system.mix_loss_weight > 0:
+                 image_embs = (image_out.last_hidden_state)
+                 text_embs = (text_out.last_hidden_state)
+                 image_embs = random_masking(image_embs, config.system.image_mask_ratio)
+                 text_embs = random_masking(text_embs, config.system.text_mask_ratio)
+                 embs = torch.cat([image_embs, text_embs], dim=1)
+                 (noise_pred,) = unet(
+                    noisy_latents, timesteps, embs, return_dict=False
+                 ) 
+                 mix_loss =  F.mse_loss(noise_pred, target, reduction="mean")
+            else:
+                mix_loss = torch.tensor(0.0)
             if config.system.clip_loss_weight > 0:
                 clip_loss_value = clip_loss(
                     F.normalize(image_out.pooler_output, dim=1), 
@@ -569,6 +600,7 @@ def main():
             loss = (
                 text_to_image_loss * config.system.text_to_image_loss_weight + 
                 image_to_image_loss * config.system.image_to_image_loss_weight + 
+                mix_loss * config.system.mix_loss_weight +
                 clip_loss_value * config.system.clip_loss_weight 
             )
             loss = loss / config.system.get("gradient_accumulation", 1)
@@ -606,6 +638,7 @@ def main():
                     "step_loss": loss.detach().item(),
                     "image_to_image_loss": image_to_image_loss.detach().item(),
                     "text_to_image_loss": text_to_image_loss.detach().item(),
+                    "mix_loss": mix_loss.detach().item(),
                     "clip_loss": clip_loss_value.detach().item(),
                     "logit_scale": logit_scale_scalar,
                     "lr": lr_scheduler.current_lr(),
@@ -618,6 +651,7 @@ def main():
             tb_writer.add_scalar("step_loss", loss.detach().item(), step)
             tb_writer.add_scalar("image_to_image_loss", image_to_image_loss.detach().item(), step)
             tb_writer.add_scalar("text_to_image_loss", text_to_image_loss.detach().item(), step)
+            tb_writer.add_scalar("mix_loss", mix_loss.detach().item(), step)
             tb_writer.add_scalar("clip_loss", clip_loss_value.detach().item(), step)
             tb_writer.add_scalar("logit_scale", logit_scale_scalar, step)
             tb_writer.add_scalar("lr", lr_scheduler.current_lr(), step)
@@ -631,6 +665,7 @@ def main():
                 f" Loss: {loss.item():0.4f}"
                 f" Image-to-Image Loss: {image_to_image_loss.item():0.4f}"
                 f" Text-to-Image Loss: {text_to_image_loss.item():0.4f}"
+                f" Mix Loss: {mix_loss.item():0.4f}"
                 f" CLIP-Loss: {clip_loss_value.item():0.4f}"
                 f" Logit-Scale: {logit_scale_scalar:0.4f}"
                 f" Step: {step}"
@@ -681,6 +716,18 @@ class TextEncoderWrapper:
     
     def __call__(self, x, attention_mask=None):
         x =  self.clip.encode_text_hidden_state(x, attention_mask=attention_mask)
+        x = x.view(1, x.shape[0], x.shape[1], x.shape[2])
+        return x
+
+class ImageEncoderWrapper:
+
+    def __init__(self, config, clip):
+        self.config = config
+        self.clip = clip
+        self.dtype = self.clip.dtype
+    
+    def __call__(self, x):
+        x =  self.clip.encode_image_hiden_state(x)
         x = x.view(1, x.shape[0], x.shape[1], x.shape[2])
         return x
 

@@ -25,7 +25,9 @@ def zero_shot_classifier(model, tokenizer, classnames, templates, device, amp=Tr
             else:
                 raise ValueError("templates must be a list or a dict")
             texts = tokenizer(texts).to(device)  # tokenize
-            class_embeddings = model.clip.hidden_state_text_projection(model.clip.text_model(texts).last_hidden_state)
+            class_embeddings = model.clip.text_model(texts).last_hidden_state
+            if model.clip.hidden_state_proj:
+                class_embeddings = model.clip.hidden_state_text_projection(class_embeddings)
             zeroshot_weights.append(class_embeddings)
         zeroshot_weights = torch.stack(zeroshot_weights, dim=0).to(device)
     print(zeroshot_weights.shape)
@@ -214,10 +216,10 @@ def pred_logits(model, images, text_embs, trials=1, bs=32):
     device = images.device
     clip_mean = clip.module.mean if hasattr(clip, "module") else clip.mean
     clip_std = clip.module.std if hasattr(clip, "module") else clip.std
-    x = (images+1)/2
-    x = (x - clip_mean) / clip_std 
-    image_out = clip.vision_model(x)
-
+    x = images
+    images = images * clip_std + clip_mean
+    images = images * 2 - 1
+    print(images.min(), images.max())    
     latents = vae.encode(images).latent_dist.sample()
     latents = latents * 0.18215
     nbims = images.shape[0]
@@ -241,6 +243,7 @@ def pred_logits(model, images, text_embs, trials=1, bs=32):
             (nbims * nbtexts,),
             device=device,
         )
+        timesteps[:] = 500
         timesteps = timesteps.long()
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
         if noise_scheduler.config.prediction_type == "epsilon":

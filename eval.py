@@ -77,81 +77,18 @@ import webdataset as wds
 
 import generative_classifier
 
-@torch.no_grad()
-def generate_examples(
-    config,
-    text_encoder,
-    vae,
-    unet,
-    tokenizer,  
-    out_dir,
-    caption_file,
-    num_examples=1000,
-    resolution=512,
-    device="cpu",
-    bs=10,
-):
-    # Make sure num_examples to generate is divisible by world_size
-    if type(caption_file) == list:
-        D = caption_file
-    else:
-        D = [caption_file] * num_examples
-    text_db = pd.DataFrame({"uid": np.arange(len(D)), "caption": D})
-    pipeline = StableDiffusionPipeline(
-        vae=vae,
-        text_encoder=text_encoder,
-        unet=unet,
-        tokenizer=tokenizer,
-        safety_checker=None,
-        feature_extractor=None,
-        scheduler=PNDMScheduler.from_config(
-            "CompVis/stable-diffusion-v1-4", subfolder="scheduler"
-        ),
-        requires_safety_checker=False,  # for internal auditing only, enable in general
-    ).to(device)
+class ClipPrime:
 
-    pipeline.set_progress_bar_config(disable=True)
-    pipeline.safety_checker = None  # disable safety checker (testing only)
-    #pipeline.enable_vae_slicing()
 
-    examples = list(zip(text_db.uid.to_list(), text_db.caption.to_list()))
-    example_shards = list(
-        batchify(
-            examples,
-            batch_size=max(num_examples, len(text_db)),
-        )
-    )
+    def __init__(self, clip):
+        self.clip = clip
 
-    #print(example_shards)
-    images = []
-    I = 0
-    for batch in batchify(
-        example_shards[0], batch_size=bs
-    ):
-        filenames, text_raw = zip(*batch)
-        print(len(text_raw))
-        rng = torch.Generator()
-        rng.manual_seed(I)
-        I += 1
+    def encode_image(self, image):
+        return self.clip.encode_image_hidden_state(image).mean(dim=1)
 
-        with torch.autocast(device_type="cuda"):
-            out = pipeline(
-                list(text_raw),
-                guidance_scale=7.5,
-                generator=rng,
-                height=resolution,
-                width=resolution,
-            )
-        images.extend(
-            [
-                torchvision.transforms.ToTensor()(image).unsqueeze(0)
-                for image in out.images
-            ]
-        )
-
-        for filename, image in zip(filenames, out.images):
-            image.save(Path(out_dir) / f"{filename}.jpg")
-
+    def encode_text(self, text):
+        return self.clip.encode_text_hidden_state(text).mean(dim=1)
+    
 device = "cuda"
 config = get_config()
 step = config.get("step","current_pipeline")
@@ -196,6 +133,17 @@ if task == "zeroshot_classification":
         dataloader,
         open_clip.tokenizer.tokenize,
         classnames, templates, 
+        device,
+    )
+elif task == "zeroshot_classification_hidden_state":
+    classnames = dataset.classes
+    templates = dataset.templates
+    clip_prime = ClipPrime(clip)
+    results = zeroshot_classification.evaluate(
+        clip_prime,
+        dataloader,
+        open_clip.tokenizer.tokenize,
+        classnames, templates[0:1], 
         device,
     )
 elif task == "generative_zeroshot_classification":

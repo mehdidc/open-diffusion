@@ -8,7 +8,8 @@
 #SBATCH --partition=booster
 #SBATCH --job-name=open-diffusion
 ml purge
-source source /p/project/laionize/miniconda/bin/activate open_clip
+ml GCC
+source /p/project/ccstdl/laion/mamba/bin/activate experimental-xformers
 export TORCH_DISTRIBUTED_DEBUG=INFO
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 export MASTER_PORT=12802
