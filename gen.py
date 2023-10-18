@@ -86,7 +86,7 @@ def generate_examples(
 ):   
     pipeline = StableDiffusionPipeline(
         vae=vae,
-        text_encoder=clip,
+        text_encoder=None,
         unet=unet,
         tokenizer=tokenizer,
         safety_checker=None,
@@ -102,7 +102,7 @@ def generate_examples(
     rng.manual_seed(0)
 
     if type(raw) == list:
-        text_tokens= tokenizer(raw, return_tensors="pt", padding=True).input_ids.to(device)
+        text_tokens = tokenizer(raw, return_tensors="pt", padding=True).input_ids.to(device)
         embs = clip.encode_text_hidden_state(text_tokens)
     else:
         embs= clip.encode_image_hidden_state(raw)
