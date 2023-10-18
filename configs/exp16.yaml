@@ -1,6 +1,4 @@
-# like exp11, bt with clip loss weight of 1
-# => best results so far 0.36 imagenet
-# images per sec per gpu: 48.82, for 64 gpus
+# like exp12 but with mix loss
 wandb:
     api_key: null
     entity: null
@@ -11,8 +9,11 @@ system:
     batch_size: 64
     workers: 4
     use_pooled_for_conditioning: False
-    image_to_image_loss_weight: 1
-    text_to_image_loss_weight: 1
+    image_to_image_loss_weight: 0
+    text_to_image_loss_weight: 0
+    mix_loss_weight: 1
+    image_mask_ratio: 0.5
+    text_mask_ratio: 0.5
     train_unet: True
     train_clip: True
     clip_loss_weight: 1
@@ -25,7 +26,7 @@ distributed:
 
 experiment:
     log_dir: ./logs
-    name: "exp12"
+    name: "exp16"
     project: "stable-diffusion-clip"
     num_examples_to_see: 128000000
     save_every: 5000
@@ -71,7 +72,8 @@ model:
 dataset:
     type: WebDataset
     params: 
-        path: /p/scratch/ccstdl/cherti1/datacomp_1B/{0000000..0139827}.tar
+        path: /p/fastdata/mmlaion/datacomp/datacomp_1B/flat/{0000000..0139827}.tar
+        #path: /p/scratch/ccstdl/cherti1/datacomp_1B/{0000000..0139827}.tar
         #path: /p/scratch/ccstdl/cherti1/pokemon-blip-captions/data/data.tar
         #path: /p/fastdata/mmlaion/laion2B-en/{00000..23295}.tar
         batch_size: ${system.batch_size}

@@ -1,4 +1,4 @@
-# train unet only, clip pre-traine and frozen
+# train unet only, clip pre-trained and frozen
 wandb:
     api_key: null
     entity: null
